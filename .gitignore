@@ -64,3 +64,8 @@ opentrack-org.hxx
 opentrack-version.hxx
 version.cpp
 *.xpl
+
+# Dev tooling: compiled standalone PSVR HID power-on utility.
+# Source `dev/psvr-poweron.c` is committed; rebuild with
+# `clang dev/psvr-poweron.c -framework IOKit -framework CoreFoundation -o dev/psvr-poweron`
+/dev/psvr-poweron

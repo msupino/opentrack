@@ -104,8 +104,18 @@ dylib_for()    { echo "$BUILD/$1/opentrack-$1.dylib"; }
 # Rewrite every absolute Qt-framework load command in the dylib to use
 # @executable_path/../Frameworks/.  Driven by `otool -L`, so it works
 # regardless of which Homebrew prefix the build linked against.
+# Also rewrite bare-dylib references for libraries that macdeployqt has
+# already copied into Contents/Frameworks (opencv, libomp, openblas,
+# ...). If two copies of such a library end up in the same process
+# under different names (e.g. /opt/homebrew/opt/libomp/lib/libomp.dylib
+# from a freshly-built plugin vs @executable_path/../Frameworks/libomp
+# .dylib from the bundled OpenBLAS), OMP's self-init check aborts with
+# "OMP: Error #15: Initializing libomp.dylib, but found libomp.dylib
+# already initialized." - same class of duplicate-runtime bug Qt would
+# trip on.
 fix_install_names() {
     local dylib="$1"
+    # Qt frameworks
     while read -r path; do
         local fw
         fw="$(basename "$(dirname "$(dirname "$(dirname "$path")")")" .framework)"
@@ -115,6 +125,21 @@ fix_install_names() {
     done < <(
         otool -L "$dylib" 2>/dev/null \
         | awk '/Qt[A-Z][a-zA-Z]*\.framework/ && ($1 ~ /^\/(opt|usr)\/(homebrew|local)/) { print $1 }'
+    )
+    # Bare dylibs already present inside Contents/Frameworks. We match
+    # /opt/homebrew or /usr/local absolute paths and redirect to the
+    # bundled basename if it exists.
+    while read -r path; do
+        local base
+        base="$(basename "$path")"
+        if [[ -f "$BUNDLE/Contents/Frameworks/$base" ]]; then
+            install_name_tool -change "$path" \
+                "@executable_path/../Frameworks/$base" \
+                "$dylib" 2>/dev/null || true
+        fi
+    done < <(
+        otool -L "$dylib" 2>/dev/null \
+        | awk '/\.dylib/ && ($1 ~ /^\/(opt|usr)\/(homebrew|local)/) { print $1 }'
     )
 }
 
@@ -162,6 +187,22 @@ if [[ $REBUILD_EXE -eq 1 ]]; then
         "$EXE_IN_BUNDLE" 2>/dev/null || true
 fi
 
+# --- delete stray CMake-produced skeleton bundle --------------------------
+# cmake's `add_executable(... MACOSX_BUNDLE ...)` drops a hollow
+# opentrack.app next to the built binary. It has no Frameworks/ dir,
+# so its exe still links to /opt/homebrew/opt/qtbase/...  LaunchServices
+# can easily pick it over install/opentrack.app in Spotlight / `open -a`
+# / the Dock, at which point it loads BOTH homebrew Qt and the bundled
+# Qt (dragged in via plugins), trips QWidgetPrivate's ABI version
+# guard, and aborts at the first QWidget construction. See crash
+# signature `QWidgetPrivate::QWidgetPrivate(QtPrivate_6_11_0) (.cold.1)
+# → qFatal → SIGABRT`.
+STRAY_BUNDLE="$BUILD/opentrack/opentrack.app"
+if [[ -d "$STRAY_BUNDLE" && ! -d "$STRAY_BUNDLE/Contents/Frameworks" ]]; then
+    echo "[hot-install] remove stray skeleton bundle at $STRAY_BUNDLE"
+    rm -rf "$STRAY_BUNDLE"
+fi
+
 # --- relaunch -------------------------------------------------------------
 echo "[hot-install] kill running opentrack"
 pkill -f 'install/opentrack.app/Contents/MacOS/opentrack' 2>/dev/null || true
@@ -176,12 +217,34 @@ SIGN_ID="-"
 if security find-identity -v -p codesigning "$HOME/Library/Keychains/login.keychain-db" \
     2>/dev/null | grep -Fq '"opentrack-dev"'; then
     SIGN_ID="opentrack-dev"
-    echo "[hot-install] re-sign bundle with stable identity '$SIGN_ID'"
 else
-    echo "[hot-install] ad-hoc re-sign bundle (no opentrack-dev cert; "
+    echo "[hot-install] ad-hoc re-sign (no opentrack-dev cert; "
     echo "              run dev/setup-signing-cert.sh to make TCC grants stick)"
 fi
-codesign --deep --force -s "$SIGN_ID" "$BUNDLE" 2>&1 | tail -1
+
+# Surgical re-sign: only the files we just copied in (plugins + maybe
+# the main exe), not the whole bundle. `codesign --deep --force` on the
+# full bundle is ~2.5 s on this tree (it recursively signs ~23 plugins
+# + ~30 Qt/OpenCV dylibs + the main exe), whereas signing a single
+# dylib is ~50 ms. Since we almost always iterate on ONE plugin at a
+# time, the difference per edit-compile-test cycle is huge.
+#
+# Launch works with surgical signing because macOS code-signing is
+# per-dylib: Gatekeeper validates each Mach-O object against its own
+# signature, not against a parent-bundle hash manifest (that's only
+# used for notarization, which a dev build doesn't need). Unsigned or
+# stale-signed untouched files keep their existing (valid) signatures
+# and load fine.
+echo "[hot-install] re-sign ${#MODULES[@]} plugin(s) with identity '$SIGN_ID'"
+for m in "${MODULES[@]}"; do
+    plug="$BUNDLE_PLUGINS/opentrack-$m.dylib"
+    [[ -f "$plug" ]] || continue
+    codesign --force -s "$SIGN_ID" "$plug" 2>&1 | tail -1
+done
+if [[ $REBUILD_EXE -eq 1 ]]; then
+    echo "[hot-install] re-sign main exe with identity '$SIGN_ID'"
+    codesign --force -s "$SIGN_ID" "$EXE_IN_BUNDLE" 2>&1 | tail -1
+fi
 
 if [[ $RELAUNCH -eq 1 ]]; then
     echo "[hot-install] relaunch"

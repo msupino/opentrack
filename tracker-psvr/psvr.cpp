@@ -9,12 +9,23 @@
 #include "psvr.h"
 #include "psvr_mirror.h"
 
+#ifdef PSVR_HAS_CAMERA
+// Pulls in the full Worker type so the unique_ptr<Worker> members in
+// psvr.h are destructible here and we can call start/stop/diag. Not
+// included from psvr.h to keep AVFoundation/OpenCV out of every file
+// that transitively includes the tracker header (only psvr.cpp needs
+// them).
+#include "psvr_camera.h"
+#endif
+
 #include <cmath>
 #include <cstring>
 #include <QDebug>
 #include <QCheckBox>
 #include <QDialogButtonBox>
+#include <QImage>
 #include <QLabel>
+#include <QPixmap>
 #include <QVBoxLayout>
 #include <QPushButton>
 
@@ -36,9 +47,8 @@ constexpr int   PSVR_PID = 0x09af;
 // register a 90° physical rotation as ~11° of integrated yaw.
 constexpr double GYRO_LSB_PER_DEG = 16.384;
 constexpr double ACCEL_LSB_PER_G  = 1024.0;
-// dt is now measured per-sample; see PSVRTracker::last_sample_time_ for
-// rationale (the assumed 200 Hz constant was off by 10x — the PSVR
-// actually emits ~2000 Hz of process_group calls).
+// dt is measured per-sample from the device's own 24-bit microsecond
+// timestamp; see the dt-computation block in process_group.
 constexpr double ALPHA = 0.98;    // complementary filter weight
 
 // Axis remap: which raw IMU axis drives which output rotation.
@@ -80,18 +90,81 @@ PSVRTracker::PSVRTracker() = default;
 
 PSVRTracker::~PSVRTracker()
 {
+    // Send cinematic-mode-on before we tear down the HID devices so
+    // the PSVR drops out of 960×2 VR split-screen mode on shutdown.
+    // Quick courtesy to the user: it means after Stop, the headset is
+    // a normal display again rather than stuck showing a distorted
+    // stereo layout. Borrowed from OpenHMD's close_device() pattern.
+    send_cinematic_mode_to_all();
+
     stop_ = true;
     if (CFRunLoopRef rl = runloop_.load(std::memory_order_acquire))
         CFRunLoopStop(rl);
     if (worker_.joinable())
         worker_.join();
     psvr_mirror_stop();
+#ifdef PSVR_HAS_CAMERA
+    // Drop the camera worker BEFORE the UI teardown below so its
+    // dispatch queue stops delivering frames while the plugin's Qt
+    // widgets are still alive (the delegate never touches widgets,
+    // but this also guarantees no late-arriving diag-log writes
+    // after diag_log_ is closed).
+    if (camera_worker_) {
+        camera_worker_->stop();
+        camera_worker_.reset();
+    }
+    // Tear down the preview. Stop the timer first so no more
+    // fetch_preview calls race with the Worker destruction above,
+    // then deleteLater both children of tracker_frame_ (the label and
+    // the timer) so Qt's parent-chain clean-up on the next event-loop
+    // spin removes them without blocking here. If opentrack already
+    // destroyed tracker_frame_ first, Qt will have already taken them
+    // along; guard with a null check.
+    if (camera_preview_timer_) {
+        camera_preview_timer_->stop();
+        camera_preview_timer_->deleteLater();
+        camera_preview_timer_ = nullptr;
+    }
+    if (camera_preview_label_) {
+        camera_preview_label_->hide();
+        camera_preview_label_->deleteLater();
+        camera_preview_label_ = nullptr;
+    }
+#endif
     // deleteLater is safe even if these widgets already went away with
     // their parent frame; it's a no-op on nullptr.
     if (calib_poll_timer_) { calib_poll_timer_->stop(); calib_poll_timer_->deleteLater(); calib_poll_timer_ = nullptr; }
     if (calib_label_)      { calib_label_->deleteLater(); calib_label_ = nullptr; }
     if (recal_button_)     { recal_button_->deleteLater(); recal_button_ = nullptr; }
     if (diag_log_)         { std::fclose(diag_log_); diag_log_ = nullptr; }
+}
+
+// Push a status message to the calibration QLabel and (when the
+// camera preview is active) also to the camera-worker overlay. When
+// the camera is on we additionally hide the QLabel so the same
+// message doesn't appear both stacked above and over the video.
+// css_color_hex selects the QLabel border/text color ("#268bd2",
+// "#b58900", "#dc322f"); r/g/b are the matching color for the
+// over-video text. UI thread only.
+void PSVRTracker::publish_status_banner(QLabel* lbl, const QString& text,
+                                        const char* css_color_hex,
+                                        int r, int g, int b)
+{
+    if (lbl) {
+        char css[256];
+        std::snprintf(css, sizeof css,
+            "QLabel { color: %s; font-weight: bold; padding: 6px; "
+            "border: 1px solid %s; border-radius: 4px; }",
+            css_color_hex, css_color_hex);
+        lbl->setStyleSheet(css);
+        lbl->setText(text);
+    }
+#ifdef PSVR_HAS_CAMERA
+    if (camera_worker_ && camera_worker_->is_running()) {
+        if (lbl) lbl->hide();
+        camera_worker_->set_status_banner(text.toStdString(), r, g, b);
+    }
+#endif
 }
 
 // Build (or rebuild) the amber "Calibrating, hold still" banner and the
@@ -110,6 +183,7 @@ void PSVRTracker::install_calibration_banner()
     calib_label_ = new QLabel(tracker_frame_);
     calib_label_->setWordWrap(true);
     calib_label_->setAlignment(Qt::AlignCenter);
+    tracker_frame_->layout()->addWidget(calib_label_);
     // Initial stage: "waiting for USB". IOHIDManagerOpen + the PSVR's
     // activation burst can take several seconds to deliver the first
     // report, during which no calibration samples are being consumed.
@@ -117,18 +191,20 @@ void PSVRTracker::install_calibration_banner()
     // user when they see 10+ seconds of "calibration" banner. Once the
     // first sample arrives (samples_flowing_ flips true), the poll
     // timer upgrades this label to the honest amber calibration text.
-    calib_label_->setStyleSheet(
-        "QLabel { color: #268bd2; font-weight: bold; padding: 6px; "
-        "border: 1px solid #268bd2; border-radius: 4px; }");
-    calib_label_->setText(QObject::tr(
-        "Waiting for PSVR on USB…\n"
-        "The headset's processor unit can take 5-15 seconds to reply\n"
-        "after Start (especially on first connection). If this banner\n"
-        "stays up for more than ~15 s the watchdog will surface a\n"
-        "specific error below."));
-    tracker_frame_->layout()->addWidget(calib_label_);
+    // Solarized blue 0x268bd2 = (38, 139, 210).
+    publish_status_banner(calib_label_, QObject::tr(
+        "Waiting for PSVR on USB… cold-boot activation can take up to "
+        "20 seconds. If the stream doesn't start after ~12 s the driver "
+        "will retry activation once automatically; an error banner "
+        "appears only if nothing arrives by ~25 s."),
+        "#268bd2", 38, 139, 210);
 
-    calib_poll_timer_ = new QTimer();
+    // Parent the timer to tracker_frame_ so Qt's parent-chain
+    // teardown destroys it automatically if opentrack tears down the
+    // frame before our destructor runs (e.g. user clicks Stop while
+    // the lambda is in flight). Without a parent, the QTimer outlives
+    // tracker_frame_ and its lambda fires with a dangling lbl pointer.
+    calib_poll_timer_ = new QTimer(tracker_frame_);
     calib_poll_timer_->setInterval(100);
     QLabel* lbl = calib_label_;
     QTimer* tmr = calib_poll_timer_;
@@ -151,48 +227,46 @@ void PSVRTracker::install_calibration_banner()
                         "No data received from the PSVR.\n"
                         "• Is the USB cable connected?\n"
                         "• Is the headset's in-line power box lit up?\n"
-                        "• Is Input Monitoring granted to opentrack in\n"
-                        "  System Settings > Privacy & Security?\n"
+                        "• Is Input Monitoring granted to opentrack in "
+                        "System Settings > Privacy & Security?\n"
                         "Fix the issue, then press Re-calibrate below.");
                     break;
                 case CALIB_FAIL_NO_GRAVITY:
                     msg = QObject::tr(
                         "The PSVR headset appears to be OFF.\n"
-                        "Data is flowing from the USB processor unit, but\n"
-                        "the accelerometer is not measuring gravity —\n"
-                        "the headset itself is asleep.\n"
-                        "Press the power button on the in-line remote\n"
+                        "Data is flowing from the USB processor unit, "
+                        "but the accelerometer is not measuring gravity "
+                        "— the headset itself is asleep.\n"
+                        "Press the power button on the in-line remote "
                         "until the screen wakes, then press Re-calibrate.");
                     break;
                 case CALIB_FAIL_WORN:
                     msg = QObject::tr(
                         "Can't calibrate while the headset is worn.\n"
-                        "Calibration needs the PSVR still on a flat\n"
-                        "surface (desk, table) so gyro bias can be\n"
+                        "Calibration needs the PSVR still on a flat "
+                        "surface (desk, table) so gyro bias can be "
                         "measured without body-motion contamination.\n"
-                        "Take it off, put it down, and press\n"
-                        "Re-calibrate. You can put it back on once\n"
-                        "the amber 'Calibrating' banner clears.");
+                        "Take it off, put it down, and press Re-calibrate. "
+                        "You can put it back on once the amber "
+                        "'Calibrating' banner clears.");
                     break;
                 case CALIB_FAIL_MOVING:
                     msg = QObject::tr(
                         "Calibration rejected — the headset moved.\n"
-                        "During the 2-second averaging window, the\n"
-                        "gyroscope measured more motion than the noise\n"
-                        "floor. If you were holding the PSVR or walking\n"
-                        "with it, set it down on a flat still surface\n"
+                        "During the 2-second averaging window, the "
+                        "gyroscope measured more motion than the noise "
+                        "floor. If you were holding the PSVR or walking "
+                        "with it, set it down on a flat still surface "
                         "(desk, table) and press Re-calibrate.\n"
-                        "If you were not moving it, a bump, knock or\n"
+                        "If you were not moving it, a bump, knock or "
                         "cable tug is usually the cause.");
                     break;
                 default:
                     msg = QObject::tr("PSVR calibration failed.");
                     break;
                 }
-                lbl->setStyleSheet(
-                    "QLabel { color: #dc322f; font-weight: bold; padding: 6px; "
-                    "border: 1px solid #dc322f; border-radius: 4px; }");
-                lbl->setText(msg);
+                // Solarized red 0xdc322f = (220, 50, 47).
+                publish_status_banner(lbl, msg, "#dc322f", 220, 50, 47);
             }
             tmr->stop();
             if (tmr == calib_poll_timer_) {
@@ -209,25 +283,30 @@ void PSVRTracker::install_calibration_banner()
         if (!*upgraded
             && samples_flowing_.load(std::memory_order_acquire)) {
             if (lbl == calib_label_) {
-                lbl->setStyleSheet(
-                    "QLabel { color: #b58900; font-weight: bold; padding: 6px; "
-                    "border: 1px solid #b58900; border-radius: 4px; }");
-                lbl->setText(QObject::tr(
+                // Solarized amber 0xb58900 = (181, 137, 0).
+                publish_status_banner(lbl, QObject::tr(
                     "Calibrating gyroscope (~3 s)\n"
-                    "Keep the PSVR PERFECTLY STILL on a flat surface.\n"
-                    "DO NOT put it on your head yet — head motion during\n"
+                    "Keep the PSVR PERFECTLY STILL on a flat surface. "
+                    "DO NOT put it on your head yet — head motion during "
                     "calibration will bake drift into the tracker.\n"
-                    "(1 s sensor-stream warmup + 2 s bias averaging.)"));
+                    "(1 s sensor-stream warmup + 2 s bias averaging.)"),
+                    "#b58900", 181, 137, 0);
             }
             *upgraded = true;
         }
         if (!calibrated_.load(std::memory_order_acquire))
             return;
-        // Success path: remove the amber banner, surface the button.
+        // Success path: remove the amber banner, surface the button,
+        // and clear the camera-overlay banner so the live preview is
+        // unobstructed for actual tracking.
         if (lbl == calib_label_) {
             lbl->deleteLater();
             calib_label_ = nullptr;
         }
+#ifdef PSVR_HAS_CAMERA
+        if (camera_worker_)
+            camera_worker_->set_status_banner("", 255, 255, 255);
+#endif
         tmr->stop();
         if (tmr == calib_poll_timer_) {
             tmr->deleteLater();
@@ -253,7 +332,16 @@ void PSVRTracker::show_recalibrate_button()
         recal_button_->setToolTip(QObject::tr(
             "Rerun the 2-second gyro-bias calibration without stopping "
             "the tracker. Put the PSVR back on a flat still surface first."));
-        tracker_frame_->layout()->addWidget(recal_button_);
+        // Insert ABOVE the calibration banner in the tracker frame's
+        // layout. The banner grows to 6-7 lines on error states and
+        // can overflow a small tracker panel; keeping the button at
+        // the TOP means it's visible regardless of banner height, so
+        // users always have the recovery action within reach.
+        auto* vbox = qobject_cast<QVBoxLayout*>(tracker_frame_->layout());
+        if (vbox)
+            vbox->insertWidget(0, recal_button_);
+        else
+            tracker_frame_->layout()->addWidget(recal_button_);
         QObject::connect(recal_button_, &QPushButton::clicked, [this]() {
             // Tear down the leftover banner/timer from a previous cycle
             // before installing a fresh one, so we don't leak widgets.
@@ -285,8 +373,29 @@ module_status PSVRTracker::start_tracker(QFrame* frame)
     if (frame) {
         if (!frame->layout())
             frame->setLayout(new QVBoxLayout(frame));
-        install_calibration_banner();
     }
+
+    // Spin up the camera worker FIRST (before installing the
+    // calibration banner) when camera mode is on. install_calibration_
+    // _banner's first publish_status_banner call needs to see a live
+    // camera_worker_ so it can route the "Waiting for PSVR" text to
+    // the video overlay instead of the QLabel above it. Otherwise the
+    // initial waiting text gets stuck in the QLabel until the next
+    // state change re-publishes (which can take 25 s if the headset
+    // isn't responding) and the user sees a banner stacked above the
+    // preview for the whole startup window. Order matters here.
+#ifdef PSVR_HAS_CAMERA
+    if (s_.enable_camera) {
+        camera_worker_ = std::make_unique<psvr_cam::Worker>();
+        if (!camera_worker_->start()) {
+            qDebug() << "[psvr] camera worker failed to start; position will be zero";
+            camera_worker_.reset();
+        }
+    }
+#endif
+
+    if (frame)
+        install_calibration_banner();
 
     // Diagnostic log setup - must happen on this thread before the worker
     // spawns, so the file handle is visible to it via the ordinary
@@ -326,7 +435,19 @@ module_status PSVRTracker::start_tracker(QFrame* frame)
                 "# 23 disp_on  (0/1; HMD display is active/awake)\n"
                 "# 24 fw_cal   (firmware-reported IMU calibration state:\n"
                 "#              255=cold boot, 0-3=calibrating, 4=calibrated)\n"
-                "# 25 ir       (raw proximity reading; 0=far, 1023=near)\n");
+                "# 25 ir       (raw proximity reading; 0=far, 1023=near)\n"
+                "# 26 cam_frames       (cumulative camera frames captured;\n"
+                "#                       0 if camera disabled or failed to start)\n"
+                "# 27 cam_frames_blob  (cumulative frames where >=1 blob\n"
+                "#                       passed the extractor thresholds)\n"
+                "# 28 cam_frames_pnp   (cumulative frames where solvePnP\n"
+                "#                       accepted the LED identification)\n"
+                "# 29 cam_last_blobs   (blob count on most recent frame)\n"
+                "# 30 cam_last_matched (blobs matched to LEDs on last frame)\n"
+                "# 31 cam_last_ok      (0/1; PnP succeeded last frame)\n"
+                "# 32-34 cam_x cam_y cam_z (last accepted head position, cm;\n"
+                "#                       camera frame: +X right, +Y up,\n"
+                "#                       -Z forward)\n");
             std::fflush(diag_log_);
         }
     }
@@ -334,13 +455,93 @@ module_status PSVRTracker::start_tracker(QFrame* frame)
     worker_ = std::thread([this]{ worker_loop(); });
     if (s_.enable_mirror)
         psvr_mirror_start();
+
+#ifdef PSVR_HAS_CAMERA
+    // The camera worker itself was started above (before
+    // install_calibration_banner) so the initial banner could route
+    // to its overlay. Here we attach the preview QLabel that displays
+    // its annotated frames inside tracker_frame_, the same spot
+    // neuralnet / easy / pt put their previews. Widget and timer are
+    // children of tracker_frame_ so opentrack's frame teardown
+    // cleans them up automatically.
+    if (camera_worker_ && camera_worker_->is_running() && tracker_frame_) {
+        camera_preview_label_ = new QLabel(tracker_frame_);
+        camera_preview_label_->setAlignment(Qt::AlignCenter);
+        camera_preview_label_->setMinimumSize(320, 180);
+        camera_preview_label_->setScaledContents(true);
+        camera_preview_label_->setSizePolicy(
+            QSizePolicy::Expanding, QSizePolicy::Expanding);
+        if (auto* lay = tracker_frame_->layout())
+            lay->addWidget(camera_preview_label_);
+
+        camera_preview_timer_ = new QTimer(tracker_frame_);
+        camera_preview_timer_->setInterval(33);  // ~30 Hz
+        // Qt 6 on macOS throttles (sometimes entirely stops) CoarseTimer
+        // callbacks when the app is backgrounded, then fails to catch up
+        // cleanly on foreground - the preview would freeze on an old
+        // frame until the user clicks inside the window. PreciseTimer
+        // uses a higher-priority dispatch source that keeps firing
+        // predictably across focus changes, trading a few extra
+        // microseconds of scheduling overhead for a reliable preview.
+        camera_preview_timer_->setTimerType(Qt::PreciseTimer);
+        QObject::connect(camera_preview_timer_, &QTimer::timeout,
+            [this]() {
+                if (!camera_worker_ || !camera_preview_label_) return;
+                int w = 0, h = 0;
+                if (!camera_worker_->fetch_preview_rgb(&camera_preview_buf_, &w, &h))
+                    return;
+                if (w <= 0 || h <= 0) return;
+                // QImage wraps the buffer without copying; QPixmap::fromImage
+                // then copies pixels into the pixmap, so we're free to
+                // mutate camera_preview_buf_ on the next tick.
+                QImage img(camera_preview_buf_.data(), w, h,
+                           3 * w, QImage::Format_RGB888);
+                camera_preview_label_->setPixmap(QPixmap::fromImage(img));
+                // Belt-and-suspenders: setPixmap already schedules an
+                // update(), but on macOS after a background->foreground
+                // cycle Qt's paint-dirty tracking can get confused and
+                // the freshly-set pixmap sits on a "clean" widget that
+                // never actually paints. Forcing update() here
+                // guarantees the next paint cycle delivers our frame.
+                camera_preview_label_->update();
+            });
+        camera_preview_timer_->start();
+    }
+#endif
     return {};
 }
 
 void PSVRTracker::data(double* data)
 {
-    // opentrack data layout: [x y z yaw pitch roll]
-    data[0] = 0; data[1] = 0; data[2] = 0;
+    // opentrack data layout: [x y z yaw pitch roll].
+    //
+    // Rotation always comes from the IMU. Position comes from the
+    // camera constellation worker when it has a fresh PnP solution;
+    // when it doesn't (camera disabled, no LEDs in frame, PnP failed),
+    // we emit zeros so opentrack's Center command lands at the
+    // calibrated origin and no spurious translations get injected.
+    //
+    // Fusion trackers can still run this plugin as the rotation source
+    // and a different tracker as the position source; in that case the
+    // Fusion plugin strips our zeros and uses the camera tracker's
+    // output. The two paths are orthogonal - enabling camera tracking
+    // here doesn't affect the Fusion case.
+    double x = 0, y = 0, z = 0;
+    bool have_pos = false;
+#ifdef PSVR_HAS_CAMERA
+    if (camera_worker_ && camera_worker_->is_running()) {
+        have_pos = camera_worker_->get_position(&x, &y, &z);
+    }
+#endif
+    camera_position_fresh_.store(have_pos, std::memory_order_relaxed);
+    if (have_pos) {
+        head_x_.store(x, std::memory_order_relaxed);
+        head_y_.store(y, std::memory_order_relaxed);
+        head_z_.store(z, std::memory_order_relaxed);
+    } else {
+        x = y = z = 0;
+    }
+    data[0] = x; data[1] = y; data[2] = z;
     data[3] = yaw_.load(std::memory_order_relaxed);
     data[4] = pitch_.load(std::memory_order_relaxed);
     data[5] = roll_.load(std::memory_order_relaxed);
@@ -358,6 +559,11 @@ void PSVRTracker::process_group(const uint8_t* buf)
         calib_gyro_accum_[0]  = calib_gyro_accum_[1]  = calib_gyro_accum_[2]  = 0;
         calib_accel_accum_[0] = calib_accel_accum_[1] = calib_accel_accum_[2] = 0;
         still_streak_axis_[0] = still_streak_axis_[1] = still_streak_axis_[2] = 0;
+        // Replenish auto-retry budget: the user explicitly asked for a
+        // fresh attempt, so we want the same forgiving behavior a cold
+        // Start has. (And if they ARE holding the headset, the auto-
+        // retries will each fail in ~3 s and then surface the banner.)
+        calib_auto_retries_left_ = CALIB_AUTO_RETRIES;
         calibrated_.store(false, std::memory_order_release);
         calib_failure_.store(CALIB_FAIL_NONE, std::memory_order_release);
         // Re-calibration is always requested mid-stream (we already
@@ -367,6 +573,9 @@ void PSVRTracker::process_group(const uint8_t* buf)
         // Reset the silent-stream watchdog baseline so a dead stream
         // gets re-reported on the next attempt instead of instantly.
         worker_start_time_ = CFAbsoluteTimeGetCurrent();
+        // Re-arm the single-shot activation nudge so a user-triggered
+        // recovery can benefit from it even within one session.
+        nudge_sent_ = false;
         qDebug() << "PSVR: re-calibration requested - resetting bias state";
     }
 
@@ -404,19 +613,17 @@ void PSVRTracker::process_group(const uint8_t* buf)
         // calibrated_ will never flip, so no pose will ever publish.
         if (calib_failure_.load(std::memory_order_relaxed) != CALIB_FAIL_NONE)
             return;
-        // Refuse to calibrate while worn: breathing, pulse and body
-        // sway all contaminate the bias average if the headset is on
-        // someone's head, producing bad drift characteristics that
-        // ZUPT has to clean up later. Cheaper to just wait for a
-        // flat-surface calibration.
-        if (worn_.load(std::memory_order_relaxed)) {
-            qWarning() << "PSVR: calibration refused - headset is worn. "
-                          "Place it still on a flat surface and press "
-                          "Re-calibrate.";
-            calib_failure_.store(CALIB_FAIL_WORN,
-                                 std::memory_order_release);
-            return;
-        }
+        // We used to short-circuit calibration on the "worn" proximity
+        // bit here, but that bit is unreliable as a "head present"
+        // signal: any flat surface a few cm in front of the visor
+        // trips it (e.g. headset placed visor-down on a desk, which
+        // is a perfectly valid calibration position). The CALIB_FAIL_
+        // MOVING gate at the end of the averaging window already
+        // catches the actual problem the worn check was guarding
+        // against - a worn headset always shows enough head motion
+        // (breathing + pulse + sway, peak |gyro| ~5-15 dps) to
+        // exceed CALIB_MAX_MOTION_DPS, so calibration fails cleanly
+        // there without false rejections from the proximity sensor.
         // Warmup: swallow the first second of post-activation samples
         // without folding them into the averages. See the comment on
         // CALIB_WARMUP_SAMPLES in psvr.h for why these samples are
@@ -446,10 +653,32 @@ void PSVRTracker::process_group(const uint8_t* buf)
             // Abort BEFORE computing bias so the bad samples never
             // get baked in; user can re-try with Re-calibrate.
             if (calib_peak_gyro_dps_ > CALIB_MAX_MOTION_DPS) {
+                // If we still have auto-retries left, silently reset the
+                // accumulators and try once more - see the comment on
+                // CALIB_AUTO_RETRIES in psvr.h for the rationale. The
+                // user never sees the failure banner in the common
+                // "PSVR just finished activating, tail spike landed
+                // inside the averaging window" case. Only when all
+                // retries have been consumed does CALIB_FAIL_MOVING
+                // get surfaced to the UI.
+                if (calib_auto_retries_left_ > 0) {
+                    qDebug().nospace()
+                        << "PSVR: calibration auto-retry (peak |gyro|="
+                        << calib_peak_gyro_dps_ << " dps); "
+                        << calib_auto_retries_left_ << " retries left";
+                    --calib_auto_retries_left_;
+                    calib_count_         = 0;
+                    calib_warmup_count_  = 0;
+                    calib_peak_gyro_dps_ = 0.0;
+                    calib_gyro_accum_[0]  = calib_gyro_accum_[1]  = calib_gyro_accum_[2]  = 0;
+                    calib_accel_accum_[0] = calib_accel_accum_[1] = calib_accel_accum_[2] = 0;
+                    return;
+                }
                 qWarning().nospace()
                     << "PSVR: calibration REJECTED - headset moved during "
                     << "averaging (peak |gyro|=" << calib_peak_gyro_dps_
-                    << " dps > " << CALIB_MAX_MOTION_DPS << " dps). "
+                    << " dps > " << CALIB_MAX_MOTION_DPS << " dps) after "
+                    << CALIB_AUTO_RETRIES << " auto-retries. "
                     << "Put it on a flat still surface and press Re-calibrate.";
                 if (diag_log_) {
                     const double now = CFAbsoluteTimeGetCurrent();
@@ -516,16 +745,11 @@ void PSVRTracker::process_group(const uint8_t* buf)
             pitch_.store(seed_pitch, std::memory_order_relaxed);
             roll_.store(seed_roll,   std::memory_order_relaxed);
             yaw_.store(0.0,          std::memory_order_relaxed);
-            // Record this device's actual rest-state |accel|; the ZUPT
-            // stillness detector compares each sample's |accel| to
-            // THIS reference instead of a hardcoded 1.0 g, so units-
-            // mis-scaled accels don't perpetually fail "still".
-            calib_gravity_mag_ = avg_mag;
             calibrated_.store(true, std::memory_order_release);
             qDebug() << "PSVR: calibrated."
                      << "gyro bias (deg/s):" << gyro_bias_[0] << gyro_bias_[1] << gyro_bias_[2]
                      << " seed pitch:" << seed_pitch << " seed roll:" << seed_roll
-                     << " local gravity mag:" << calib_gravity_mag_ << "g";
+                     << " local gravity mag:" << avg_mag << "g";
             if (diag_log_) {
                 const double now = CFAbsoluteTimeGetCurrent();
                 std::fprintf(diag_log_,
@@ -593,21 +817,34 @@ void PSVRTracker::process_group(const uint8_t* buf)
     const double acc_pitch = accel_pitch_deg(a);
     const double acc_roll  = accel_roll_deg(a);
 
-    // Per-sample dt for gyro integration. Bounded so a transient stream
-    // stall (one big gap) can't inject a giant integration step that
-    // sends pose flying. The first sample after Start uses a sane
-    // fallback because last_sample_time_ is 0; subsequent samples use
-    // the real measured interval.
-    const double now_ts = CFAbsoluteTimeGetCurrent();
+    // Per-sample dt from the PSVR's own 24-bit microsecond timestamp
+    // (at bytes 0-3 of each sample group). This is the IMU's hardware
+    // sample-rate crystal, so it's immune to OS scheduler jitter that
+    // plagues a wall-clock-based dt. The counter wraps at 0xFFFFFF
+    // microseconds (~16.7 s); the rollover handling below follows
+    // OpenHMD's pattern: the uint32_t subtraction produces a very
+    // large value when wrapping, we detect and normalize. Bounded to
+    // [DT_MIN, DT_MAX] to defang any garbage reading (e.g., a stale
+    // buffered sample from a previous session, which the PSVR is
+    // documented to sometimes emit at session start).
+    const uint32_t tick =
+          (uint32_t)buf[0]
+        | ((uint32_t)buf[1] << 8)
+        | ((uint32_t)buf[2] << 16)
+        | ((uint32_t)buf[3] << 24);
     double dt;
-    if (last_sample_time_ <= 0.0) {
-        dt = DT_FALLBACK;
-    } else {
-        dt = now_ts - last_sample_time_;
+    if (last_sample_tick_valid_) {
+        uint32_t tick_delta = tick - last_sample_tick_;
+        if (tick_delta > 0xFFFFFFu)   // 24-bit counter wrapped
+            tick_delta += 0x1000000u;
+        dt = tick_delta * 1e-6;       // microseconds → seconds
         if (dt < DT_MIN) dt = DT_MIN;
         if (dt > DT_MAX) dt = DT_MAX;
+    } else {
+        dt = DT_FALLBACK;
+        last_sample_tick_valid_ = true;
     }
-    last_sample_time_ = now_ts;
+    last_sample_tick_ = tick;
 
     double yaw   = yaw_.load(std::memory_order_relaxed)   + gy * dt;
     double pitch = ALPHA * (pitch_.load(std::memory_order_relaxed) + gp * dt) + (1.0 - ALPHA) * acc_pitch;
@@ -619,6 +856,21 @@ void PSVRTracker::process_group(const uint8_t* buf)
     yaw_.store(yaw,     std::memory_order_relaxed);
     pitch_.store(pitch, std::memory_order_relaxed);
     roll_.store(roll,   std::memory_order_relaxed);
+
+#ifdef PSVR_HAS_CAMERA
+    // Push the freshest attitude to the camera worker, which uses it
+    // as a prior for projecting the 9-LED model into image space when
+    // matching blobs. Cheap (3 atomic stores); called at ~2 kHz IMU
+    // sample rate; the camera pipeline reads it at ~30 Hz. Converting
+    // to radians here means the camera code doesn't have to know or
+    // care about opentrack's degree convention.
+    if (camera_worker_) {
+        const double deg2rad = M_PI / 180.0;
+        camera_worker_->set_rotation_prior(yaw   * deg2rad,
+                                           pitch * deg2rad,
+                                           roll  * deg2rad);
+    }
+#endif
 
     // Optional diagnostic log. One row per second. `g[]` here is
     // post-bias (deg/s), `a[]` is accel in g. We recompute acc-only
@@ -640,6 +892,28 @@ void PSVRTracker::process_group(const uint8_t* buf)
             diag_last_log_time_ = now;
             const double acc_mag =
                 std::sqrt(a[0]*a[0] + a[1]*a[1] + a[2]*a[2]);
+            // Camera (constellation) diagnostics. When the camera
+            // worker isn't running, we log zeros; consumers can tell
+            // by seeing constant-zero columns that the feature was
+            // disabled for this session.
+            uint64_t cam_frames = 0, cam_any_blob = 0, cam_pnp_ok = 0;
+            int cam_last_blobs = 0, cam_last_matched = 0;
+            int cam_last_ok = 0;
+            double cam_x = 0, cam_y = 0, cam_z = 0;
+#ifdef PSVR_HAS_CAMERA
+            if (camera_worker_ && camera_worker_->is_running()) {
+                const auto d = camera_worker_->diag();
+                cam_frames       = d.frames_captured;
+                cam_any_blob     = d.frames_with_any_blob;
+                cam_pnp_ok       = d.pnp_ok_count;
+                cam_last_blobs   = d.last_n_blobs;
+                cam_last_matched = d.last_n_matched;
+                cam_last_ok      = d.last_pnp_ok ? 1 : 0;
+                cam_x = d.last_x_cm;
+                cam_y = d.last_y_cm;
+                cam_z = d.last_z_cm;
+            }
+#endif
             std::fprintf(diag_log_,
                 "%.3f\t%7.2f\tRUN\t%+8.3f\t%+8.3f\t%+8.3f"
                 "\t%+7.3f\t%+7.3f\t%+7.3f"
@@ -647,7 +921,8 @@ void PSVRTracker::process_group(const uint8_t* buf)
                 "\t%+6.3f\t%+6.3f\t%+6.3f\t%5.3f"
                 "\t%+7.2f\t%+7.2f"
                 "\t%.1f\t%llu\t%d"
-                "\t%d\t%d\t%u\t%u\n",
+                "\t%d\t%d\t%u\t%u"
+                "\t%llu\t%llu\t%llu\t%d\t%d\t%d\t%+6.1f\t%+6.1f\t%+6.1f\n",
                 now, now - diag_start_time_,
                 yaw, pitch, roll,
                 g[YAW_SRC], g[PITCH_SRC], g[ROLL_SRC],
@@ -660,7 +935,12 @@ void PSVRTracker::process_group(const uint8_t* buf)
                 worn_.load(std::memory_order_relaxed) ? 1 : 0,
                 display_active_.load(std::memory_order_relaxed) ? 1 : 0,
                 (unsigned)fw_cal_status_.load(std::memory_order_relaxed),
-                (unsigned)ir_sensor_.load(std::memory_order_relaxed));
+                (unsigned)ir_sensor_.load(std::memory_order_relaxed),
+                (unsigned long long)cam_frames,
+                (unsigned long long)cam_any_blob,
+                (unsigned long long)cam_pnp_ok,
+                cam_last_blobs, cam_last_matched, cam_last_ok,
+                cam_x, cam_y, cam_z);
             std::fflush(diag_log_);
         }
     }
@@ -687,7 +967,12 @@ void PSVRTracker::report_cb(void* context, IOReturn, void*,
     self->display_active_.store(
         (flags & 0x02) == 0, std::memory_order_relaxed);
     self->fw_cal_status_.store(report[48], std::memory_order_relaxed);
-    // 10-bit IR proximity reading spans bytes 55-56 (big-endian).
+    // 10-bit IR proximity reading spans bytes 55-56, little-endian
+    // (low byte at 55, high byte at 56). Verified against PSVRFramework's
+    // sensor-frame decoder and against the values logged into our diag
+    // (smooth 0-1023 sweep as a hand approaches the visor). An older
+    // version of this comment said "big-endian" which contradicted the
+    // code; the code was right.
     self->ir_sensor_.store(
         uint16_t(report[55]) | (uint16_t(report[56]) << 8),
         std::memory_order_relaxed);
@@ -769,6 +1054,34 @@ void PSVRTracker::send_activation_to_all()
     std::lock_guard<std::mutex> lk(devices_mu_);
     for (auto& md : devices_)
         send_activation(md.device);
+}
+
+// Send a single HID output report to every matched device. Used for
+// courtesy commands like "set cinematic mode" on shutdown.
+void PSVRTracker::send_raw_to_all(uint8_t cmd,
+                                  const uint8_t* payload, size_t len)
+{
+    std::lock_guard<std::mutex> lk(devices_mu_);
+    uint8_t report[64]{};
+    report[0] = cmd;
+    report[1] = 0x00;
+    report[2] = 0xAA;
+    report[3] = static_cast<uint8_t>(len);
+    if (payload && len > 0) std::memcpy(report + 4, payload, len);
+    for (auto& md : devices_)
+        IOHIDDeviceSetReport(md.device, kIOHIDReportTypeOutput,
+                             cmd, report, 4 + len);
+}
+
+// Put the headset into cinematic (single-screen) display mode. Called
+// on tracker shutdown so the PSVR isn't stuck in 960×2 VR split-
+// screen mode afterwards — a small UX courtesy borrowed from OpenHMD's
+// drv_psvr close_device(). The in-line remote's mode button can also
+// do this manually, but automating it means the user doesn't have to.
+void PSVRTracker::send_cinematic_mode_to_all()
+{
+    const uint8_t vrmode_off[4] = {0x00, 0x00, 0x00, 0x00};
+    send_raw_to_all(0x23, vrmode_off, sizeof(vrmode_off));
 }
 
 void PSVRTracker::device_matched_cb(void* context, IOReturn, void*, IOHIDDeviceRef device)
@@ -876,14 +1189,38 @@ void PSVRTracker::worker_loop()
         // which dispatches on this very CFRunLoop thread.
         if (calib_failure_.load(std::memory_order_relaxed) == CALIB_FAIL_NONE
             && !calibrated_.load(std::memory_order_relaxed)
-            && calib_count_ == 0
-            && (CFAbsoluteTimeGetCurrent() - worker_start_time_) > NO_DATA_TIMEOUT_SEC)
+            && calib_count_ == 0)
         {
-            qWarning() << "PSVR: no HID reports within"
-                       << NO_DATA_TIMEOUT_SEC
-                       << "s of Start - headset off / unplugged / permissions missing";
-            calib_failure_.store(CALIB_FAIL_NO_DATA,
-                                 std::memory_order_release);
+            const double elapsed =
+                CFAbsoluteTimeGetCurrent() - worker_start_time_;
+
+            // Nudge: at the halfway point to the hard timeout, if we
+            // still haven't heard from the PSVR, re-fire the
+            // activation burst ONCE. Common cause of silent startup
+            // is that our first activation arrived while the PSVR's
+            // own firmware was mid-boot and got dropped; retrying
+            // after the firmware has had a chance to settle
+            // frequently wakes it up without needing user action.
+            if (!nudge_sent_ && elapsed > NO_DATA_NUDGE_SEC) {
+                qWarning() << "PSVR: no HID reports within"
+                           << NO_DATA_NUDGE_SEC
+                           << "s of Start - retrying activation burst";
+                send_activation_to_all();
+                nudge_sent_ = true;
+            }
+
+            // Hard fail only once the full timeout has elapsed. By
+            // this point we've given the PSVR the full cold-boot
+            // window and one retry; if it's still silent it's not
+            // coming back on its own.
+            if (elapsed > NO_DATA_TIMEOUT_SEC) {
+                qWarning() << "PSVR: no HID reports within"
+                           << NO_DATA_TIMEOUT_SEC
+                           << "s of Start - headset off / unplugged /"
+                              " permissions missing";
+                calib_failure_.store(CALIB_FAIL_NO_DATA,
+                                     std::memory_order_release);
+            }
         }
 
         // Post-calibration stall-recovery keepalive. Only arms once
@@ -955,11 +1292,21 @@ PSVRDialog::PSVRDialog()
     diag_log_box_->setChecked(s_.enable_diag_log);
     layout->addWidget(diag_log_box_);
 
+    camera_box_ = new QCheckBox(QObject::tr(
+        "Enable camera-based position tracking [experimental]\n"
+        "Uses the PSVR's built-in blue LEDs + a webcam to recover head "
+        "X/Y/Z. First activation requests Camera permission. Blob "
+        "detection runs on every frame; PnP solver lands in a follow-"
+        "up commit, so today this only records diagnostic data."));
+    camera_box_->setChecked(s_.enable_camera);
+    layout->addWidget(camera_box_);
+
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
     layout->addWidget(buttons);
     QObject::connect(buttons, &QDialogButtonBox::accepted, this, [this]() {
         s_.enable_mirror   = mirror_box_->isChecked();
         s_.enable_diag_log = diag_log_box_->isChecked();
+        s_.enable_camera   = camera_box_->isChecked();
         s_.b->save();
         accept();
     });

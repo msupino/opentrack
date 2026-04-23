@@ -23,15 +23,27 @@
 #include <QLabel>
 #include <QPushButton>
 #include <QTimer>
+#include <QWidget>
 
 #include <IOKit/hid/IOHIDManager.h>
 #include <CoreFoundation/CoreFoundation.h>
+
+// Optional webcam-based position tracker; full definition in
+// psvr_camera.h, included by psvr.cpp only.
+#ifdef PSVR_HAS_CAMERA
+namespace psvr_cam { class Worker; }
+#endif
 
 using namespace options;
 
 struct psvr_settings : opts {
     value<bool> enable_mirror;
     value<bool> enable_diag_log;
+    // Optional: use a webcam to track the PSVR's blue LED constellation
+    // for head POSITION (X/Y/Z). Orthogonal to the IMU path, which
+    // always provides rotation. Defaults off because the first frame
+    // triggers macOS's Camera TCC prompt; users opt in via the dialog.
+    value<bool> enable_camera;
     psvr_settings() :
         opts("psvr-tracker"),
         // Default OFF: turning the mirror on is what triggers macOS's
@@ -40,7 +52,8 @@ struct psvr_settings : opts {
         // of a fresh install. Users who want the SBS mirror opt in
         // via the checkbox in the tracker settings dialog.
         enable_mirror(b, "enable-sbs-mirror", false),
-        enable_diag_log(b, "enable-diag-log", false)
+        enable_diag_log(b, "enable-diag-log", false),
+        enable_camera(b, "enable-camera", false)
     {}
 };
 
@@ -80,16 +93,6 @@ private:
     // whole calibration noticeably longer.
     static constexpr int CALIB_WARMUP_SAMPLES = 200;
     int calib_warmup_count_{0};
-
-    // Local gravity magnitude as measured by THIS specific PSVR's
-    // accelerometer during the calibration pass. Captured at the end
-    // of calibration purely as a diagnostic / log entry: it tells us
-    // by how much this unit's accel scale differs from the ideal 1.0g
-    // (commonly off by 1-5% from the factory). Not consumed by the
-    // current ZUPT detector, which is gyro-only - kept around because
-    // it's a one-line capture and a useful signal for any future
-    // accel-aware filter (e.g., gravity-magnitude-aware tilt rejection).
-    double calib_gravity_mag_{1.0};
 
     std::atomic<bool> calibrated_{false};
     int calib_count_{0};
@@ -142,6 +145,23 @@ private:
     double calib_peak_gyro_dps_{0.0};
     static constexpr double CALIB_MAX_MOTION_DPS = 5.0;
 
+    // Auto-retry counter for the motion-rejection path. Typical first-
+    // calibration failure pattern: the gyro's post-activation settling
+    // transient extends ~0.5 s past the CALIB_WARMUP window on a cold
+    // PSVR, so the averaging window catches a decaying tail spike that
+    // pushes peak |gyro| above 5 dps and flunks the check. By the time
+    // the user notices and clicks Re-calibrate, the stream has been
+    // running for many more seconds and the sensor is rock stable,
+    // which is why Re-calibrate usually "just works" where Start
+    // didn't. We remove the user-visible failure for those first few
+    // attempts by silently resetting the accumulators and retrying up
+    // to CALIB_AUTO_RETRIES times before surfacing CALIB_FAIL_MOVING.
+    // The counter is replenished when the user manually clicks
+    // Re-calibrate (in case they *are* holding the headset and the
+    // retries should all fail so they see the banner).
+    static constexpr int CALIB_AUTO_RETRIES = 2;
+    int calib_auto_retries_left_{CALIB_AUTO_RETRIES};
+
     // Status bits parsed out of the 64-byte HID input report, byte 8:
     //   bit 0 - Worn (proximity sensor detects head contact)
     //   bit 1 - INVERTED DisplayActive (0 = display on, 1 = off)
@@ -168,6 +188,21 @@ private:
     // session"; the worker's stall watchdog skips the check in that
     // state to give USB startup its full NO_DATA_TIMEOUT_SEC window.
     double last_report_time_{0.0};
+
+    // Per-sample device timestamp tracking for gyro integration dt.
+    // Each IMU sample group in the PSVR HID report carries a 24-bit
+    // microsecond tick counter in its first 4 bytes (wraps at
+    // 0xFFFFFF). We compute dt from the tick delta rather than from
+    // wall-clock — wall-clock has OS-scheduler jitter of hundreds of
+    // microseconds under system load; the device clock is the IMU's
+    // hardware sample-rate crystal and is rock-steady.
+    // `last_sample_tick_valid_` gates the very first sample since
+    // there's no prior reference; it falls back to DT_FALLBACK once,
+    // then uses real deltas from then on.
+    // Cross-referenced with OpenHMD/drv_psvr and PSVRFramework, which
+    // both use this approach. Expected delta: ~500 us (= 2000 Hz).
+    uint32_t last_sample_tick_{0};
+    bool     last_sample_tick_valid_{false};
     // How long the HID stream must be silent before we try to wake
     // the headset. 5 s is comfortably above the PSVR's per-report
     // jitter (~0.5 ms at 2000 Hz) and below the ~8 min auto-sleep
@@ -176,18 +211,29 @@ private:
     static constexpr double STALL_RECOVERY_SEC = 5.0;
 
     // Wall-clock (CFAbsoluteTime) marker set just before the worker
-    // enters its main runloop; used purely for the NO_DATA timeout.
+    // enters its main runloop; used by the NO_DATA watchdog and the
+    // silent-stream nudge below.
     //
-    // The timeout is deliberately generous: on macOS,
-    // IOHIDManagerOpen + the 0x17/0x11 activation burst can take
-    // 5-10 s before the first HID input report reaches us (the
-    // exact latency depends on USB port, hub chain, whether another
-    // process had the device open, etc.). A shorter timeout false-
-    // positives on slow-but-healthy startups. A genuinely-off
-    // headset produces no reports ever, so 15 s is still responsive
-    // for real failures.
+    // On macOS, IOHIDManagerOpen + the 0x17/0x11/0x23 activation
+    // burst can take 10-20 s before the first HID input report
+    // reaches us on a cold-boot PSVR (the exact latency depends on
+    // USB port, hub chain, whether another process just opened the
+    // device, and whether the headset's firmware is booting fresh
+    // from deep-off). A shorter timeout false-positives on slow-
+    // but-healthy startups; a genuinely-off headset produces no
+    // reports ever, so 25 s is still responsive for real failures.
+    //
+    // At the NUDGE boundary (half the full timeout), if we've still
+    // heard nothing, we re-fire the activation burst ONCE, since a
+    // common failure mode is that the first activation was sent
+    // while the PSVR's own firmware was still booting and it got
+    // dropped on the floor. nudge_sent_ is the idempotency guard:
+    // we only nudge once per session to avoid the stream-stall
+    // feedback loop the old 10-s periodic keepalive had.
     double worker_start_time_{0.0};
-    static constexpr double NO_DATA_TIMEOUT_SEC = 15.0;
+    bool   nudge_sent_{false};
+    static constexpr double NO_DATA_NUDGE_SEC    = 12.0;
+    static constexpr double NO_DATA_TIMEOUT_SEC  = 25.0;
 
     // Flipped true on the first HID report ever consumed. Used by
     // the UI poll timer to upgrade the "waiting for USB" banner to
@@ -257,15 +303,9 @@ private:
     // ever shows up in the user's view as drift.
     int still_streak_axis_[3]{0, 0, 0};
 
-    // Wall-clock (CFAbsoluteTime) of the last consumed sample. Used to
-    // compute the actual dt for gyro integration on each sample, instead
-    // of trusting a hardcoded constant. Diag logs revealed the PSVR
-    // delivers ~2000 Hz of process_group calls (1000 Hz HID reports,
-    // 2 groups each), not the 200 Hz the original code assumed; using
-    // a 0.005 s constant integrated yaw 10x too fast on real motion.
-    // Now we measure dt every sample, with a sane bound so a one-shot
-    // stream stall doesn't blow up integration with a 5 s "step".
-    double last_sample_time_{0.0};
+    // dt bounds for gyro integration. Protects against garbage tick
+    // values (e.g., a stale buffered sample at session start) without
+    // hard-failing: clamp, integrate, keep going.
     static constexpr double DT_FALLBACK = 0.0005;  // first sample, ~2000 Hz
     static constexpr double DT_MIN      = 0.0001;  // 10 kHz upper rate cap
     static constexpr double DT_MAX      = 0.05;    // 20 Hz lower rate cap
@@ -308,6 +348,17 @@ private:
     std::atomic<bool> recalibrate_request_{false};
 
     void install_calibration_banner();    // UI-thread only
+
+    // Update the calibration QLabel (text + CSS), then if the camera
+    // preview is active, also push the same text to the camera-worker
+    // overlay so the message appears on the live video and the QLabel
+    // can be hidden (avoiding the "two banners stacked" visual). Color
+    // is RGB 0-255; CSS-side colors come from the shared constants
+    // table in psvr.cpp. UI-thread only.
+    void publish_status_banner(QLabel* lbl,
+                               const QString& text,
+                               const char* css_color_hex,
+                               int r, int g, int b);
     void show_recalibrate_button();       // UI-thread only
 
     // Optional diagnostic log. Enabled by a checkbox in the settings
@@ -326,9 +377,42 @@ private:
     double diag_last_sample_rate_{0};
     double diag_start_time_{0};
 
+    // Optional webcam-based position tracker. Forward-declared so the
+    // header doesn't leak AVFoundation/OpenCV types to consumers. The
+    // unique_ptr is non-null only when camera tracking is enabled AND
+    // the Worker::start() call at Start-time returned true. The full
+    // type is included in psvr.cpp where both the ctor (which creates
+    // the Worker) and dtor (which must see the complete type) live.
+#ifdef PSVR_HAS_CAMERA
+    std::unique_ptr<psvr_cam::Worker> camera_worker_;
+#endif
+    // Head position in opentrack units (cm), published by the camera
+    // worker when PnP succeeds. When the camera is disabled or has no
+    // fresh solution, these stay at 0 (or the last good value); data()
+    // reads them via std::memory_order_relaxed.
+    std::atomic<double> head_x_{0}, head_y_{0}, head_z_{0};
+    // Set by data() consumers so diag logging can tell which fields
+    // are actually going out to opentrack. Redundant with
+    // camera_worker_->is_running() when enabled; kept for log clarity
+    // when it's not.
+    std::atomic<bool> camera_position_fresh_{false};
+
+    // Inline camera preview: a QLabel added to the same tracker-frame
+    // that opentrack passes to start_tracker, so the live feed shows
+    // up exactly where the other tracker plugins' previews do (below
+    // the settings area in the main window) rather than in a separate
+    // popup. The QTimer ticks on the GUI thread and pulls RGB data
+    // from the camera worker. Created on start_tracker, deleted in
+    // the destructor via deleteLater. Buffer reused across ticks.
+    QLabel*              camera_preview_label_{nullptr};
+    QTimer*              camera_preview_timer_{nullptr};
+    std::vector<uint8_t> camera_preview_buf_;
+
     void worker_loop();
     void send_activation(IOHIDDeviceRef device);
-    void send_activation_to_all();  // iterates devices_ under the lock
+    void send_activation_to_all();           // iterates devices_ under the lock
+    void send_cinematic_mode_to_all();       // 0x23 VRMode(OFF) to all devices
+    void send_raw_to_all(uint8_t cmd, const uint8_t* payload, size_t len);
 
     static void report_cb(void* context, IOReturn result, void* sender,
                           IOHIDReportType type, uint32_t reportID,
@@ -352,6 +436,7 @@ private:
     psvr_settings s_;
     QCheckBox* mirror_box_{nullptr};
     QCheckBox* diag_log_box_{nullptr};
+    QCheckBox* camera_box_{nullptr};
 };
 
 class PSVRMetadata : public Metadata
