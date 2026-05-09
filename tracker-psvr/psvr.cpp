@@ -1417,19 +1417,49 @@ PSVRDialog::PSVRDialog()
                     "only records diagnostic data."),
         s_.enable_camera);
 
-    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
-    layout->addWidget(buttons);
-    QObject::connect(buttons, &QDialogButtonBox::accepted, this, [this]() {
-        s_.enable_mirror   = mirror_box_->isChecked();
-        s_.enable_diag_log = diag_log_box_->isChecked();
-        s_.enable_camera   = camera_box_->isChecked();
-        s_.b->save();
+    buttons_ = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    layout->addWidget(buttons_);
+    QObject::connect(buttons_, &QDialogButtonBox::accepted, this, [this]() {
+        save();   // delegate to the embeddable-aware save
         accept();
     });
-    QObject::connect(buttons, &QDialogButtonBox::rejected, this, [this]() {
-        s_.b->reload();
+    QObject::connect(buttons_, &QDialogButtonBox::rejected, this, [this]() {
+        reload();
         reject();
     });
+}
+
+// Hide our own button box when the dialog is rendered as a tab inside
+// the global Options dialog, which provides its own OK/Cancel and would
+// otherwise stack a duplicate button row underneath ours. Called by the
+// Options dialog's add_module_tab lambda before the dialog is shown.
+void PSVRDialog::set_buttons_visible(bool x)
+{
+    if (buttons_)
+        buttons_->setVisible(x);
+}
+
+// Persist the current widget state into the settings backing store.
+// Two callers: (a) our own QDialogButtonBox accepted handler when shown
+// standalone, (b) the global Options dialog's OK button when this
+// dialog is embedded as a tab. Both expect the same write semantics.
+void PSVRDialog::save()
+{
+    if (mirror_box_)   s_.enable_mirror   = mirror_box_->isChecked();
+    if (diag_log_box_) s_.enable_diag_log = diag_log_box_->isChecked();
+    if (camera_box_)   s_.enable_camera   = camera_box_->isChecked();
+    s_.b->save();
+}
+
+// Reload widget state from the settings backing store. Called when
+// the user cancels (standalone) or rejects the embedded Options
+// dialog. Discards any in-dialog edits that haven't been save()d.
+void PSVRDialog::reload()
+{
+    s_.b->reload();
+    if (mirror_box_)   mirror_box_->setChecked(s_.enable_mirror);
+    if (diag_log_box_) diag_log_box_->setChecked(s_.enable_diag_log);
+    if (camera_box_)   camera_box_->setChecked(s_.enable_camera);
 }
 
 OPENTRACK_DECLARE_TRACKER(PSVRTracker, PSVRDialog, PSVRMetadata)

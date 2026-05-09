@@ -19,6 +19,7 @@
 #include <QObject>
 #include <QIcon>
 #include <QCheckBox>
+#include <QDialogButtonBox>
 #include <QFrame>
 #include <QLabel>
 #include <QPushButton>
@@ -470,18 +471,28 @@ public:
     void register_tracker(ITracker*) override {}
     void unregister_tracker() override {}
     // Opt into being shown as a "Tracker" tab inside the global Options
-    // dialog (in addition to the wrench-icon standalone dialog). Worth
-    // experimenting with even though the live-preview frame and
-    // calibration banner make this dialog taller than the typical
-    // embedded-friendly plugin (PT, RS, trackhat, accela, etc.) — if it
-    // fits visually we get the convenience for free; if it doesn't the
-    // user can still use the wrench icon and we revert.
+    // dialog (in addition to the wrench-icon standalone dialog). The
+    // standalone path still works; embedding just adds a convenience tab
+    // alongside Shortcuts/Output/Game-detection.
     bool embeddable() noexcept override { return true; }
+    // When embedded as a tab, the Options dialog has its own OK/Cancel
+    // button box at the bottom and delegates to our save()/reload() on
+    // accept/reject. Hide our own QDialogButtonBox to avoid the duplicate
+    // button row, and implement save()/reload() so the Options OK button
+    // persists our settings the same way the standalone OK does.
+    void set_buttons_visible(bool x) override;
+    void save() override;
+    void reload() override;
 private:
     psvr_settings s_;
     QCheckBox* mirror_box_{nullptr};
     QCheckBox* diag_log_box_{nullptr};
     QCheckBox* camera_box_{nullptr};
+    // Held as a member so set_buttons_visible() can hide it when this
+    // dialog is rendered as an embedded tab inside the global Options
+    // dialog (which provides its own OK/Cancel and would otherwise stack
+    // a duplicate button row underneath ours).
+    QDialogButtonBox* buttons_{nullptr};
 };
 
 class PSVRMetadata : public Metadata
