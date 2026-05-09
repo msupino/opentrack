@@ -469,6 +469,14 @@ public:
     PSVRDialog();
     void register_tracker(ITracker*) override {}
     void unregister_tracker() override {}
+    // Opt into being shown as a "Tracker" tab inside the global Options
+    // dialog (in addition to the wrench-icon standalone dialog). Worth
+    // experimenting with even though the live-preview frame and
+    // calibration banner make this dialog taller than the typical
+    // embedded-friendly plugin (PT, RS, trackhat, accela, etc.) — if it
+    // fits visually we get the convenience for free; if it doesn't the
+    // user can still use the wrench icon and we revert.
+    bool embeddable() noexcept override { return true; }
 private:
     psvr_settings s_;
     QCheckBox* mirror_box_{nullptr};

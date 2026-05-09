@@ -1361,26 +1361,47 @@ PSVRDialog::PSVRDialog()
     header->setWordWrap(true);
     layout->addWidget(header);
 
-    mirror_box_ = new QCheckBox(QObject::tr(
-        "Mirror the main display side-by-side onto the PSVR screen "
-        "(requires Screen Recording permission)"));
-    mirror_box_->setChecked(s_.enable_mirror);
-    layout->addWidget(mirror_box_);
+    // Helper: a checkbox + a wrapped, indented, dim description label.
+    // QCheckBox doesn't support setWordWrap natively, so multi-line
+    // descriptions overflow horizontally when the dialog is embedded as
+    // a tab inside the global Options dialog (narrow tab area). Splitting
+    // the short toggle label from the longer explanation into two widgets
+    // gives each one the wrapping behavior it needs.
+    auto add_check_with_desc = [&](QCheckBox*& cb, const QString& title,
+                                   const QString& desc, bool initial)
+    {
+        cb = new QCheckBox(title);
+        cb->setChecked(initial);
+        layout->addWidget(cb);
+        auto* d = new QLabel(desc);
+        d->setWordWrap(true);
+        d->setIndent(24);
+        d->setStyleSheet("color: gray; margin-bottom: 6px;");
+        layout->addWidget(d);
+    };
 
-    diag_log_box_ = new QCheckBox(QObject::tr(
-        "Write diagnostic log to /tmp/psvr-diag.log "
-        "(pose, gyro, accel, bias, sample rate; one row per second)"));
-    diag_log_box_->setChecked(s_.enable_diag_log);
-    layout->addWidget(diag_log_box_);
+    add_check_with_desc(mirror_box_,
+        QObject::tr("Mirror main display onto PSVR (side-by-side)"),
+        QObject::tr("Captures the main display and presents it as a "
+                    "stereoscopic side-by-side image on the PSVR screen. "
+                    "Requires Screen Recording permission."),
+        s_.enable_mirror);
 
-    camera_box_ = new QCheckBox(QObject::tr(
-        "Enable camera-based position tracking [experimental]\n"
-        "Uses the PSVR's built-in blue LEDs + a webcam to recover head "
-        "X/Y/Z. First activation requests Camera permission. Blob "
-        "detection runs on every frame; PnP solver lands in a follow-"
-        "up commit, so today this only records diagnostic data."));
-    camera_box_->setChecked(s_.enable_camera);
-    layout->addWidget(camera_box_);
+    add_check_with_desc(diag_log_box_,
+        QObject::tr("Write diagnostic log"),
+        QObject::tr("Writes one row per second to /tmp/psvr-diag.log: "
+                    "pose, gyro, accel, bias, sample rate. Useful for "
+                    "debugging tracking issues."),
+        s_.enable_diag_log);
+
+    add_check_with_desc(camera_box_,
+        QObject::tr("Enable camera-based position tracking [experimental]"),
+        QObject::tr("Uses the PSVR's built-in blue LEDs and a webcam to "
+                    "recover head X/Y/Z position. First activation requests "
+                    "Camera permission. Blob detection runs every frame; "
+                    "PnP solver lands in a follow-up commit, so today this "
+                    "only records diagnostic data."),
+        s_.enable_camera);
 
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
     layout->addWidget(buttons);
