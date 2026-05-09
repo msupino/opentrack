@@ -158,24 +158,31 @@ constexpr double kDefaultUserZCm        = 60.0; // cold-start Z guess
 constexpr double kMinAcceptableZCm      = 20.0; // sanity floor
 constexpr double kMaxAcceptableZCm      = 200.0;// sanity ceiling
 
-// Lazy-open the per-instance debug log on first solve() call. Default
-// path is /tmp/psvr-constellation.log; PSVR_CONSTELLATION_LOG env var
-// overrides (set to empty string to disable). Returns nullptr if
-// disabled. Holds impl.log_mu only during the open; subsequent calls
-// just return impl.log_fp directly.
+// Lazy-open the per-instance debug log on first solve() call.
+//
+// Logging is OFF BY DEFAULT to match the rest of tracker-psvr's
+// "no implicit disk writes" policy (see psvr_settings::enable_diag_log,
+// also off by default). Two ways to turn it on:
+//
+//   * Set the PSVR_CONSTELLATION_LOG env var to a writable path before
+//     launching opentrack. Useful for ad-hoc debugging / scripting.
+//
+//   * Tick the "Write diagnostic log" checkbox in the PSVR tracker
+//     settings; PSVRTracker::start_tracker setenv()s
+//     PSVR_CONSTELLATION_LOG to /tmp/psvr-constellation.log so the
+//     IMU diag log and constellation log are gated by a single
+//     user-visible toggle.
+//
+// Holds impl.log_mu only during the open; subsequent calls just
+// return impl.log_fp directly.
 FILE* debug_log_fp(SolverState::Impl& impl) {
     std::lock_guard<std::mutex> lk(impl.log_mu);
     if (impl.log_attempted) return impl.log_fp;
     impl.log_attempted = true;
     const char* env = std::getenv("PSVR_CONSTELLATION_LOG");
-    const char* path;
-    if (env) {
-        if (!*env) return nullptr; // explicitly disabled
-        path = env;
-    } else {
-        path = "/tmp/psvr-constellation.log";
-    }
-    impl.log_fp = std::fopen(path, "w");
+    if (!env || !*env)
+        return nullptr;  // off by default unless explicitly opted in
+    impl.log_fp = std::fopen(env, "w");
     if (impl.log_fp) {
         std::fprintf(impl.log_fp,
             "# PSVR constellation solver debug. One line per solve() call.\n"

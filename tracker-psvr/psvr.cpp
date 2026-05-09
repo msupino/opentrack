@@ -19,6 +19,7 @@
 #endif
 
 #include <cmath>
+#include <cstdlib>      // setenv/unsetenv (constellation-log toggle bridge)
 #include <cstring>
 #include <QDebug>
 #include <QCheckBox>
@@ -419,6 +420,19 @@ module_status PSVRTracker::start_tracker(QFrame* frame)
     // spawns, so the file handle is visible to it via the ordinary
     // happens-before provided by std::thread construction. Column header
     // documents the schema so log files are self-describing.
+    //
+    // The constellation solver in psvr_constellation.cpp keeps its own
+    // per-instance log file (different schema, one row per solve() call
+    // rather than per-second summaries), gated by the PSVR_CONSTELLATION_LOG
+    // env var. Bridge enable_diag_log to that env var here so the user's
+    // single "Write diagnostic log" checkbox controls both files atomically;
+    // unsetenv on the OFF path so a previous session's setenv doesn't keep
+    // the constellation log open when the user clears the checkbox.
+    if (s_.enable_diag_log) {
+        ::setenv("PSVR_CONSTELLATION_LOG", "/tmp/psvr-constellation.log", 1);
+    } else {
+        ::unsetenv("PSVR_CONSTELLATION_LOG");
+    }
     if (s_.enable_diag_log) {
         diag_log_ = std::fopen("/tmp/psvr-diag.log", "w");
         if (diag_log_) {
