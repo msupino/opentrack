@@ -136,6 +136,7 @@ PSVRTracker::~PSVRTracker()
     if (calib_poll_timer_) { calib_poll_timer_->stop(); calib_poll_timer_->deleteLater(); calib_poll_timer_ = nullptr; }
     if (calib_label_)      { calib_label_->deleteLater(); calib_label_ = nullptr; }
     if (recal_button_)     { recal_button_->deleteLater(); recal_button_ = nullptr; }
+    if (keepalive_timer_)  { keepalive_timer_->stop(); keepalive_timer_->deleteLater(); keepalive_timer_ = nullptr; }
     if (diag_log_)         { std::fclose(diag_log_); diag_log_ = nullptr; }
 }
 
@@ -508,6 +509,50 @@ module_status PSVRTracker::start_tracker(QFrame* frame)
         camera_preview_timer_->start();
     }
 #endif
+
+    // EXPERIMENTAL keepalive: spin up a periodic HID-command sender
+    // aimed at defeating the PSVR's 8-minute auto-sleep. Off by
+    // default; user opts in via [psvr-tracker] keepalive-enable=true
+    // in the ini. The byte sent and the interval are also ini-tweakable
+    // so we can iterate over the unexplored HID command space without
+    // rebuilding. Each fire is logged to the diag log so we can
+    // correlate with whether the headset stayed awake.
+    if (s_.keepalive_enable && tracker_frame_) {
+        const int interval_ms = std::max(5000, (int)s_.keepalive_interval_s * 1000);
+        // Parse keepalive-cmd with auto-base detection: accepts
+        // "0x1F" (hex), "31" (decimal), "0o37" (octal). Bad input
+        // falls through to 0x1F default - safer than zero, which
+        // would silently send a no-op every minute.
+        bool ok = false;
+        const int parsed = static_cast<QString>(s_.keepalive_cmd).toInt(&ok, 0);
+        const uint8_t cmd = ok ? (uint8_t)(parsed & 0xff) : 0x1F;
+        if (!ok) {
+            qWarning().nospace()
+                << "PSVR: keepalive-cmd '" << static_cast<QString>(s_.keepalive_cmd)
+                << "' didn't parse as int; falling back to 0x1F";
+        }
+        keepalive_timer_ = new QTimer(tracker_frame_);
+        keepalive_timer_->setInterval(interval_ms);
+        keepalive_timer_->setTimerType(Qt::CoarseTimer);  // sub-second
+                                                          // precision unnecessary
+        QObject::connect(keepalive_timer_, &QTimer::timeout, [this, cmd]() {
+            send_raw_to_all(cmd, nullptr, 0);
+            qDebug().nospace() << "PSVR: keepalive HID cmd 0x"
+                               << QString::number(cmd, 16) << " sent";
+            if (diag_log_) {
+                const double now = CFAbsoluteTimeGetCurrent();
+                std::fprintf(diag_log_,
+                    "%.3f\t%7.2f\tKEEPALIVE\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-"
+                    "\t-\t-\t-\t-\t-\t-\t-\t-\t0x%02x\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\n",
+                    now, now - diag_start_time_, (unsigned)cmd);
+                std::fflush(diag_log_);
+            }
+        });
+        keepalive_timer_->start();
+        qDebug().nospace() << "PSVR: keepalive enabled - cmd 0x"
+                           << QString::number(cmd, 16)
+                           << " every " << (interval_ms / 1000) << "s";
+    }
     return {};
 }
 
