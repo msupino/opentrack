@@ -355,6 +355,23 @@ void PSVRTracker::show_recalibrate_button()
                 calib_label_->deleteLater();
                 calib_label_ = nullptr;
             }
+            // Clear the previous-cycle success/streaming flags BEFORE
+            // requesting re-cal. Otherwise:
+            //   * stale calibrated_=true would make the banner's poll
+            //     timer immediately enter the success path, even with
+            //     the USB unplugged and the worker thread starved of
+            //     samples (so it never consumes the request) - the
+            //     calibration appeared to "succeed" instantly.
+            //   * stale samples_flowing_=true would make the banner
+            //     upgrade from "Waiting for PSVR on USB..." straight
+            //     to "Calibrating..." without waiting to see whether
+            //     samples are actually flowing post-click.
+            // The worker will re-assert both atomics from real state:
+            // samples_flowing_ on the next inbound report (or in
+            // process_group's re-cal block at line ~626), and
+            // calibrated_ once the bias-averaging window completes.
+            calibrated_.store(false, std::memory_order_release);
+            samples_flowing_.store(false, std::memory_order_release);
             // Ask the HID worker to restart calibration. The worker
             // owns the non-atomic accumulators, so it performs the
             // reset itself at the top of process_group.
@@ -1226,18 +1243,37 @@ void PSVRTracker::worker_loop()
     while (!stop_) {
         CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.1, true);
 
-        // Silent-stream detection. If no HID reports ever arrive in the
-        // first NO_DATA_TIMEOUT_SEC of Start, either the USB cable is
-        // unplugged, the processor box is dead, or Input Monitoring
-        // permission was refused. calib_count_ is safe to read here
-        // without synchronization: it's written only from report_cb,
-        // which dispatches on this very CFRunLoop thread.
+        // Silent-stream detection. Two cases this needs to catch:
+        //   (a) Cold start: no HID reports ever arrive in the first
+        //       NO_DATA_TIMEOUT_SEC of Start - cable unplugged, box
+        //       dead, or Input Monitoring permission refused.
+        //   (b) Mid-session re-calibrate with the USB pulled: the
+        //       click handler set recalibrate_request_=true and
+        //       cleared calibrated_, but no samples are arriving so
+        //       process_group() can't consume the request and reset
+        //       calib_count_/worker_start_time_. Surface the same
+        //       NO_DATA failure so the user sees the red banner
+        //       instead of the calibration appearing to succeed.
+        // calib_count_ is safe to read here without synchronization:
+        // it's written only from report_cb, which dispatches on this
+        // very CFRunLoop thread.
+        const bool re_cal_pending =
+            recalibrate_request_.load(std::memory_order_relaxed);
         if (calib_failure_.load(std::memory_order_relaxed) == CALIB_FAIL_NONE
             && !calibrated_.load(std::memory_order_relaxed)
-            && calib_count_ == 0)
+            && (calib_count_ == 0 || re_cal_pending))
         {
-            const double elapsed =
-                CFAbsoluteTimeGetCurrent() - worker_start_time_;
+            // Reference timestamp: for case (a) this is worker_start_time_
+            // (set once in start_tracker). For case (b) we want the
+            // elapsed time since the LAST sample arrived rather than
+            // since session start, because the session may have been
+            // running for hours before the user pulled the cable.
+            // Falls back to worker_start_time_ if no sample has ever
+            // arrived (last_report_time_ stays 0.0 in that case).
+            const double ref = (last_report_time_ > 0.0)
+                                   ? last_report_time_
+                                   : worker_start_time_;
+            const double elapsed = CFAbsoluteTimeGetCurrent() - ref;
 
             // Nudge: at the halfway point to the hard timeout, if we
             // still haven't heard from the PSVR, re-fire the
