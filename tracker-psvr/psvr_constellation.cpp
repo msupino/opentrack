@@ -35,14 +35,18 @@
  * Coordinate frame notes
  * ----------------------
  * Head frame (as used in kLEDModel below): +X = user's right, +Y = up,
- * -Z = forward-where-face-points. When the user faces the camera with
- * zero IMU rotation, the head-to-camera flip is 180 deg around Z: user
- * right (+X_head) becomes camera left (-X_cam, because camera sees the
- * mirror image of the user), user up (+Y_head) becomes camera up which
- * in OpenCV is -Y_cam. The forward axes end up aligned (user's -Z_head
- * points at the camera, which is also -Z_cam in OpenCV's "+Z into the
- * scene" convention, since "into the scene" from the camera's POV
- * means toward where the user is).
+ * +Z = back of head (right-handed; cross(+X, +Y) = +Z). Forward-where-
+ * face-points is -Z. The model coordinates differ from PSMoveService's
+ * original by a Z-sign flip - see the comment on kLEDModel - because
+ * cv::solvePnP needs a right-handed model frame.
+ *
+ * When the user faces the camera with zero IMU rotation, the head-to-
+ * camera flip is 180 deg around Z: user right (+X_head) becomes camera
+ * left (-X_cam, because the camera sees the mirror image of the user),
+ * user up (+Y_head) becomes camera-image up which in OpenCV is -Y_cam,
+ * and +Z_head (back of head, away from camera) maps to +Z_cam (into
+ * scene, also away from camera). So R_flip = diag(-1, -1, 1) which is
+ * a proper rotation (det = +1).
  *
  * Why no constellation brute-force search
  * ---------------------------------------
@@ -77,8 +81,21 @@ namespace psvr_constellation {
 // a known-pose checkerboard visible in the same frame — out of scope
 // for this plugin.
 //
-// Coordinate frame: +X = user's right, +Y = up, -Z = forward (toward
-// the room). Origin at approximate visor center.
+// Coordinate frame: +X = user's right, +Y = up, +Z = back of head
+// (right-handed; cross(+X,+Y) = +Z). Forward-where-face-points is
+// therefore -Z. Origin at approximate visor center.
+//
+// IMPORTANT: this is NOT verbatim PSMoveService - their model is
+// stored in a left-handed frame (+Z forward) with rear LEDs at z=-24.
+// Passing an LH-handed model to cv::solvePnP doesn't work: the
+// rotation Jacobian assumes a proper RH rotation (det=+1), so the
+// solver either fails outright or finds a "mirror" pose that lands
+// the head behind the camera and trips the z-sanity gate. We
+// therefore negate every Z coordinate vs. PSMoveService to obtain a
+// RH-consistent geometry; the resulting (rvec, tvec) is then a
+// proper rigid transform that the rest of the pipeline handles
+// unmodified. The `head_to_camera_rotation` flip below (180° about
+// Z) is also correct under this convention.
 //
 // LED index mapping:
 //   0  center front (visor between eyebrows)
@@ -92,14 +109,14 @@ namespace psvr_constellation {
 //   8  left rear  (strap, near base of skull)
 static const std::array<cv::Point3d, NUM_LEDS> kLEDModel = {{
     { 0.0,  0.0,   0.0},
-    { 8.0,  4.5,  -2.5},
-    { 9.0,  0.0, -10.0},
-    { 8.0, -4.5,  -2.5},
-    {-8.0,  4.5,  -2.5},
-    {-9.0,  0.0, -10.0},
-    {-8.0, -4.5,  -2.5},
-    { 6.0, -1.0, -24.0},
-    {-6.0, -1.0, -24.0},
+    { 8.0,  4.5,   2.5},
+    { 9.0,  0.0,  10.0},
+    { 8.0, -4.5,   2.5},
+    {-8.0,  4.5,   2.5},
+    {-9.0,  0.0,  10.0},
+    {-8.0, -4.5,   2.5},
+    { 6.0, -1.0,  24.0},
+    {-6.0, -1.0,  24.0},
 }};
 
 // Per-instance solver state; previously TU-globals (g_state_*, g_log_*)
@@ -237,9 +254,14 @@ cv::Matx33d head_to_camera_rotation(double yaw, double pitch, double roll) {
     const cv::Matx33d Rz( cr, -sr, 0.0,
                           sr,  cr, 0.0,
                          0.0, 0.0, 1.0);
-    // User-facing-camera default: +X_head -> -X_cam, +Y_head -> -Y_cam,
-    // +Z_head -> +Z_cam. That's diag(-1, -1, 1), a 180 deg rotation
-    // about Z (det = +1, proper rotation).
+    // User-facing-camera default: +X_head -> -X_cam (user's right is
+    // camera's image-left), +Y_head -> -Y_cam (camera image-Y points
+    // down in OpenCV, so head-up flips), +Z_head -> +Z_cam (head-back
+    // and camera-into-scene both point away from camera). That's
+    // diag(-1, -1, 1), a 180 deg rotation about Z (det = +1, proper
+    // rotation). Note the model's Z handedness (see kLEDModel) was
+    // chosen to make this flip work as a proper rotation - the
+    // PSMoveService original used LH coords and would not.
     const cv::Matx33d R_flip(-1.0, 0.0, 0.0,
                               0.0, -1.0, 0.0,
                               0.0, 0.0, 1.0);
@@ -632,9 +654,17 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
         }
     }
 
-    // Accept. Cache as prior for the next frame, and convert the OpenCV
-    // camera frame (+Y down, +Z into scene) to the Worker's consumer
-    // convention (+Y up, -Z forward).
+    // Accept. Cache as prior for the next frame and pass tvec through
+    // verbatim in cm. This is the same convention tracker-aruco and
+    // tracker-pt use (data[TX/TY/TZ] = tvec.x/y/z in cm), so a user
+    // who's configured curves for those trackers gets identical
+    // behavior here. OpenCV camera frame: +X right (camera-image),
+    // +Y down, +Z into scene (away from camera). Previously we
+    // flipped Y and Z into an OpenGL-style frame; that was
+    // inconsistent with every other opentrack camera tracker and
+    // forced users to invert axes in opentrack's curve UI on top
+    // of the standard centering operation, which masked the
+    // "doesn't move" symptom as "moves the wrong way".
     {
         std::lock_guard<std::mutex> lk(s.state_mu);
         s.state_rvec      = rvec;
@@ -644,9 +674,9 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
     }
 
     r.ok   = true;
-    r.x_cm =  tvec(0);
-    r.y_cm = -tvec(1);
-    r.z_cm = -tvec(2);
+    r.x_cm = tvec(0);
+    r.y_cm = tvec(1);
+    r.z_cm = tvec(2);
     log_frame(dbg, yaw_rad, pitch_rad, roll_rad, prior_tvec,
               blobs, projected, visible,
               r.n_matched, true, rms, tvec, "ACCEPT");

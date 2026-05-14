@@ -38,7 +38,11 @@ namespace psvr_cam {
 
 // Per-frame camera-tracking result.
 struct Result {
-    double x_cm{0};       // PSVR center in camera frame, cm (+X right, +Y up, -Z forward)
+    // Head origin in the OpenCV camera frame, cm:
+    //   +X right (camera-image), +Y down, +Z into scene (away from camera).
+    // Matches tracker-aruco / tracker-pt conventions; the consumer is
+    // free to invert axes via opentrack's curve UI.
+    double x_cm{0};
     double y_cm{0};
     double z_cm{0};
     int    n_blobs{0};    // how many blue blobs passed the extractor

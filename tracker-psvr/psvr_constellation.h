@@ -20,12 +20,13 @@
 
 namespace psvr_constellation {
 
-// Per-frame solver output. Position in camera-frame cm, +X right,
-// +Y up, -Z forward (OpenCV convention). `ok == false` means the
-// solver didn't find a plausible pose this frame; `n_matched` and
-// `n_blobs_total` are still filled so callers can log the failure
-// mode (too few blobs, identification ambiguous, high reprojection
-// error, etc.).
+// Per-frame solver output. Position is the head origin in the OpenCV
+// camera frame, in cm: +X right (camera-image), +Y down, +Z into
+// scene (away from camera). Same convention tracker-aruco and
+// tracker-pt use. `ok == false` means the solver didn't find a
+// plausible pose this frame; `n_matched` and `n_blobs_total` are
+// still filled so callers can log the failure mode (too few blobs,
+// identification ambiguous, high reprojection error, etc.).
 //
 // Debug overlay data (projected / visible / matched_blob_idx) is
 // filled even on reject paths so callers can render what the solver
