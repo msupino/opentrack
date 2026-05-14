@@ -66,12 +66,25 @@
 namespace psvr_cam {
 
 // Freshness window for publish/consume. Camera runs at ~30 Hz; we allow
-// up to ~5 frames (~160ms) of staleness before the reader treats the
+// up to ~15 frames (~500 ms) of staleness before the reader treats the
 // position as "unknown" and falls back to its default (usually zero).
-// Longer windows let position survive a single missed frame without
-// the pose visibly snapping; shorter windows feel more responsive when
-// the camera occasionally hiccups.
-static constexpr double RESULT_STALE_SEC = 0.2;
+// Tuned to match the "degrades gracefully to IMU-only within ~500 ms"
+// behavior the plugin's docs promise: short enough that a real loss
+// of tracking (helmet leaves the frame) is reflected promptly, long
+// enough that a few consecutive failed PnP frames (one blink-like
+// LED dropout, a moving lamp briefly confusing the matcher) don't
+// visibly snap the user's position to zero. The previous 200 ms
+// window was tight enough that any minor hiccup cleared position;
+// users perceived that as "position tracking doesn't do anything".
+static constexpr double RESULT_STALE_SEC = 0.5;
+
+// Periodic [psvr-cam] stderr summary cadence (frames). At ~30 Hz this
+// emits one line per second - low enough to read at a glance without
+// flooding the console. Independent of the diag-log toggle so users
+// can verify the camera is actually seeing blobs / solving PnP from
+// the same console they use to watch USB HID startup, without first
+// enabling the verbose constellation log file.
+static constexpr int PSVR_CAM_LOG_INTERVAL_FRAMES = 30;
 
 // Minimum / maximum blob area in pixels for the extractor. The PSVR
 // LEDs at ~60cm from a 720p camera image at ~70deg HFOV occupy roughly
@@ -699,7 +712,10 @@ static void process_frame(Worker::Impl* s, CVPixelBufferRef buf) {
     }
 
     // Diag bookkeeping (protected by a lightweight mutex only during
-    // bulk copy; fine even at 60 Hz).
+    // bulk copy; fine even at 60 Hz). Snapshot the cumulative counters
+    // here so the periodic stderr summary below can read them without
+    // re-acquiring the mutex.
+    uint64_t frames_after = 0, blob_after = 0, pnp_after = 0;
     {
         std::lock_guard<std::mutex> lk(s->diag_mu);
         s->diag.frames_captured++;
@@ -713,6 +729,29 @@ static void process_frame(Worker::Impl* s, CVPixelBufferRef buf) {
             s->diag.last_y_cm = r.y_cm;
             s->diag.last_z_cm = r.z_cm;
         }
+        frames_after = s->diag.frames_captured;
+        blob_after   = s->diag.frames_with_any_blob;
+        pnp_after    = s->diag.pnp_ok_count;
+    }
+
+    // Periodic [psvr-cam] stderr summary. One line per
+    // PSVR_CAM_LOG_INTERVAL_FRAMES frames (~1 s at 30 fps), unconditional
+    // on the diag-log toggle. Lets a user verify "did the camera see
+    // any LEDs?" / "did PnP succeed?" from the same console they're
+    // already watching for USB HID activity.
+    if (frames_after > 0 &&
+        (frames_after % (uint64_t)PSVR_CAM_LOG_INTERVAL_FRAMES) == 0) {
+        std::fprintf(stderr,
+            "[psvr-cam] frames=%llu  any_blob=%llu  pnp_ok=%llu  "
+            "last: blobs=%d matched=%d pnp=%s pos=[%+.1f %+.1f %+.1f]\n",
+            (unsigned long long)frames_after,
+            (unsigned long long)blob_after,
+            (unsigned long long)pnp_after,
+            (int)blobs.size(), r.n_matched,
+            r.ok ? "OK" : "--",
+            r.ok ? r.x_cm : 0.0,
+            r.ok ? r.y_cm : 0.0,
+            r.ok ? r.z_cm : 0.0);
     }
 }
 
