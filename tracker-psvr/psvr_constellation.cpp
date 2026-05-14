@@ -374,10 +374,42 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
         prior_tvec(2) = kDefaultUserZCm;
     }
 
+    // Camera position in HEAD frame: C = -R^T * t. Used for the
+    // facing-camera visibility filter below. Doing the dot product
+    // in head frame (rather than camera frame) avoids transforming a
+    // separate "outward normal" vector per LED: for a roughly
+    // spherical helmet the LED's outward normal is approximately its
+    // position vector from the head origin, so "LED faces camera"
+    // reduces to C_head . P_head > P_head . P_head.
+    const cv::Matx33d R_T = R.t();
+    const cv::Vec3d   C_head = -(R_T * prior_tvec);
+
     // Project each LED model point into the image under (R, prior_tvec).
-    // LEDs behind the camera or off-screen can't be matched; skip them.
-    // Also written through to r.projected/r.visible so debug overlays
-    // can visualize them even when the match/PnP step later rejects.
+    // LEDs are dropped from the visibility set if any of:
+    //   * They're behind the camera (Pcam.z <= 1cm).
+    //   * They're off-screen (u/v outside image bounds).
+    //   * Their outward-facing direction points away from the camera
+    //     (the helmet itself is occluding them). The visor center
+    //     LED has no defined outward direction so we skip the check
+    //     for it; it's effectively always visible from the front
+    //     hemisphere anyway.
+    //
+    // Without this filter, the rear strap LEDs (indices 7-8) projected
+    // somewhere in the image whenever they were in-frame geometrically,
+    // and the random-sample inner loop below frequently picked them as
+    // correspondence candidates for blobs that physically came from
+    // front-of-visor LEDs. The resulting AP3P hypothesis would either
+    // be impossible-Z (rejected) or low-quality (drowned in the
+    // inlier-count race by other random samples), so the correct
+    // identification rarely won. With the filter, the candidate LED
+    // set is typically 4-6 forward-facing LEDs that ARE in fact what
+    // the camera is seeing, which gives permutation-RANSAC a vastly
+    // better-conditioned problem to solve.
+    //
+    // Cold-start case (no fresh IMU prior): prior_tvec is set above
+    // by back-projecting the blob centroid to kDefaultUserZCm, so
+    // C_head lands near (small, small, -60) and the front-facing
+    // LEDs pass while the rear ones don't.
     std::array<cv::Point2d, NUM_LEDS> projected;
     std::array<bool, NUM_LEDS>        visible{};
     for (int i = 0; i < NUM_LEDS; ++i) {
@@ -385,6 +417,22 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
         const cv::Vec3d P = R * model_pt + prior_tvec;
         r.matched_blob_idx[i] = -1;
         if (P(2) <= 1.0) { visible[i] = false; r.visible[i] = false; continue; }
+
+        // Facing-camera check. The 1.0 cm^2 floor handles the visor-
+        // center LED (|P_head| = 0) without a magic special-case
+        // branch: when r2 is tiny we just skip the gate and treat the
+        // LED as visible from any reasonable angle.
+        const cv::Vec3d Phead(kLEDModel[i].x, kLEDModel[i].y, kLEDModel[i].z);
+        const double r2 = Phead.dot(Phead);
+        if (r2 > 1.0) {
+            const double cdotp = C_head.dot(Phead);
+            if (cdotp <= r2) {
+                visible[i] = false;
+                r.visible[i] = false;
+                continue;
+            }
+        }
+
         const double u = K(0, 0) * P(0) / P(2) + K(0, 2);
         const double v = K(1, 1) * P(1) / P(2) + K(1, 2);
         if (u < 0 || u >= img_w || v < 0 || v >= img_h) {
