@@ -35,8 +35,18 @@ struct Result {
     bool   ok{false};
     double x_cm{0}, y_cm{0}, z_cm{0};
     int    n_matched{0};       // blobs that were assigned to LEDs
+    int    n_visible{0};       // LEDs that passed the facing-camera filter
     int    n_blobs_total{0};   // input blob count
     double reprojection_rms{0};// in pixels; only meaningful when ok
+
+    // Short tag identifying the path that produced this Result. One
+    // of: "OK", "TOO_FEW_BLOBS", "TOO_FEW_VISIBLE", "NO_AP3P_FIT",
+    // "RANSAC_FEW_INLIERS", "HIGH_RMS", "Z_OUT_OF_RANGE", "JUMP".
+    // Lifetime: points to a static string literal owned by the
+    // solver; safe to copy or dereference without ownership tracking.
+    // Used by the camera worker's periodic [psvr-cam] stderr summary
+    // so users can tell at a glance why matched=0 frames are failing.
+    const char* reject_reason{"OK"};
 
     // Projected image-space (u, v) of each of the 9 model LEDs under
     // the prior pose used for matching. Only meaningful where the

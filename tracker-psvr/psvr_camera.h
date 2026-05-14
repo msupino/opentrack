@@ -56,8 +56,16 @@ struct Diag {
     uint64_t frames_with_any_blob{0};
     uint64_t pnp_ok_count{0};
     int      last_n_blobs{0};
+    int      last_n_visible{0};   // LEDs that passed facing-camera filter
     int      last_n_matched{0};
     bool     last_pnp_ok{false};
+    // Short tag for the latest solver outcome - "OK", "TOO_FEW_BLOBS",
+    // "TOO_FEW_VISIBLE", "NO_AP3P_FIT", "RANSAC_FEW_INLIERS",
+    // "HIGH_RMS", "Z_OUT_OF_RANGE", "JUMP". Empty until the first
+    // frame solves. std::string (not const char*) so the snapshot
+    // copy is self-contained: a caller can hold the Diag value past
+    // any solver state changes without dangling pointer concerns.
+    std::string last_reject_reason;
     double   last_x_cm{0}, last_y_cm{0}, last_z_cm{0};
 };
 

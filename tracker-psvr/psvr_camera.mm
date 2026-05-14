@@ -748,9 +748,11 @@ static void process_frame(Worker::Impl* s, CVPixelBufferRef buf) {
         s->diag.frames_captured++;
         if (!blobs.empty()) s->diag.frames_with_any_blob++;
         if (r.ok)           s->diag.pnp_ok_count++;
-        s->diag.last_n_blobs   = (int)blobs.size();
-        s->diag.last_n_matched = r.n_matched;
-        s->diag.last_pnp_ok    = r.ok;
+        s->diag.last_n_blobs        = (int)blobs.size();
+        s->diag.last_n_visible      = r.n_visible;
+        s->diag.last_n_matched      = r.n_matched;
+        s->diag.last_pnp_ok         = r.ok;
+        s->diag.last_reject_reason  = r.reject_reason;
         if (r.ok) {
             s->diag.last_x_cm = r.x_cm;
             s->diag.last_y_cm = r.y_cm;
@@ -770,12 +772,14 @@ static void process_frame(Worker::Impl* s, CVPixelBufferRef buf) {
         (frames_after % (uint64_t)PSVR_CAM_LOG_INTERVAL_FRAMES) == 0) {
         std::fprintf(stderr,
             "[psvr-cam] frames=%llu  any_blob=%llu  pnp_ok=%llu  "
-            "last: blobs=%d matched=%d pnp=%s pos=[%+.1f %+.1f %+.1f]\n",
+            "last: blobs=%d vis=%d matched=%d pnp=%s reject=%s "
+            "pos=[%+.1f %+.1f %+.1f]\n",
             (unsigned long long)frames_after,
             (unsigned long long)blob_after,
             (unsigned long long)pnp_after,
-            (int)blobs.size(), r.n_matched,
+            (int)blobs.size(), r.n_visible, r.n_matched,
             r.ok ? "OK" : "--",
+            r.reject_reason,
             r.ok ? r.x_cm : 0.0,
             r.ok ? r.y_cm : 0.0,
             r.ok ? r.z_cm : 0.0);

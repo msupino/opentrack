@@ -326,6 +326,7 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
     r.n_blobs_total = (int)blobs.size();
     FILE* dbg = debug_log_fp(s);
     if ((int)blobs.size() < kMinInliers) {
+        r.reject_reason = "TOO_FEW_BLOBS";
         if (dbg) {
             std::array<cv::Point2d, NUM_LEDS> empty_proj{};
             std::array<bool, NUM_LEDS>        empty_vis{};
@@ -498,10 +499,11 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
     // case bounded regardless of blob count.
     const int k = 4;  // min for P3P + disambiguation
     if ((int)blobs.size() < k) {
+        r.reject_reason = "TOO_FEW_BLOBS";
         log_frame(dbg, yaw_rad, pitch_rad, roll_rad, prior_tvec,
                   blobs, projected, visible,
                   0, false, 0, cv::Vec3d(0, 0, 0),
-                  "REJECT_TOO_FEW_MATCHES");
+                  "REJECT_TOO_FEW_BLOBS");
         return r;
     }
 
@@ -510,11 +512,13 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
     std::vector<int> visible_leds;
     for (int i = 0; i < NUM_LEDS; ++i)
         if (visible[i]) visible_leds.push_back(i);
+    r.n_visible = (int)visible_leds.size();
     if ((int)visible_leds.size() < k) {
+        r.reject_reason = "TOO_FEW_VISIBLE";
         log_frame(dbg, yaw_rad, pitch_rad, roll_rad, prior_tvec,
                   blobs, projected, visible,
                   0, false, 0, cv::Vec3d(0, 0, 0),
-                  "REJECT_TOO_FEW_MATCHES");
+                  "REJECT_TOO_FEW_VISIBLE");
         return r;
     }
 
@@ -639,10 +643,11 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
 
     r.n_matched = best_inliers;
     if (r.n_matched < kMinInliers) {
+        r.reject_reason = "NO_AP3P_FIT";
         log_frame(dbg, yaw_rad, pitch_rad, roll_rad, prior_tvec,
                   blobs, projected, visible,
                   r.n_matched, false, 0, cv::Vec3d(0, 0, 0),
-                  "REJECT_TOO_FEW_MATCHES");
+                  "REJECT_NO_AP3P_FIT");
         return r;
     }
 
@@ -681,6 +686,7 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
                                        inliers,
                                        cv::SOLVEPNP_ITERATIVE);
     if (!ok || inliers.rows < kMinInliers) {
+        r.reject_reason = "RANSAC_FEW_INLIERS";
         log_frame(dbg, yaw_rad, pitch_rad, roll_rad, prior_tvec,
                   blobs, projected, visible,
                   ok ? (int)inliers.rows : 0, false, 0, tvec,
@@ -703,6 +709,7 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
     const double rms = std::sqrt(sum_sq / (double)inliers.rows);
     r.reprojection_rms = rms;
     if (rms > kMaxReprojectionRMSPx) {
+        r.reject_reason = "HIGH_RMS";
         log_frame(dbg, yaw_rad, pitch_rad, roll_rad, prior_tvec,
                   blobs, projected, visible,
                   r.n_matched, true, rms, tvec, "REJECT_HIGH_RMS");
@@ -714,6 +721,7 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
     // against the screen or across the room, far outside any desk-
     // flight-sim use case.
     if (tvec(2) < kMinAcceptableZCm || tvec(2) > kMaxAcceptableZCm) {
+        r.reject_reason = "Z_OUT_OF_RANGE";
         log_frame(dbg, yaw_rad, pitch_rad, roll_rad, prior_tvec,
                   blobs, projected, visible,
                   r.n_matched, true, rms, tvec, "REJECT_Z_OUT_OF_RANGE");
@@ -732,6 +740,7 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
         const cv::Vec3d d = tvec - jump_ref_tvec;
         const double jump = std::sqrt(d.dot(d));
         if (jump > kMaxCmPerFrame) {
+            r.reject_reason = "JUMP";
             log_frame(dbg, yaw_rad, pitch_rad, roll_rad, jump_ref_tvec,
                       blobs, projected, visible,
                       r.n_matched, true, rms, tvec, "REJECT_JUMP");
