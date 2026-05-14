@@ -1387,46 +1387,6 @@ PSVRDialog::PSVRDialog()
     layout->addWidget(header);
 
     // Camera picker at the top of the dialog. Populated from the same
-    // shared enumerator (compat/camera-names) that tracker-easy and
-    // tracker-pt use, so the names match what the user sees in those
-    // other dialogs. The first entry is an explicit "(default camera)"
-    // option whose value is an empty string - that keeps the legacy
-    // [AVCaptureDevice defaultDeviceWithMediaType:] behavior available
-    // and is what an unmigrated ini file (no "camera-name" key) lands
-    // on. We tie by currentText, which is the localizedName for real
-    // entries and "" for the default placeholder, so the .ini value
-    // stays compatible with the cross-plugin "camera-name" convention.
-    {
-        auto* cam_row = new QHBoxLayout();
-        auto* cam_lbl = new QLabel(QObject::tr("Camera"));
-        camera_name_box_ = new QComboBox();
-        camera_name_box_->addItem(QObject::tr("(default camera)"), QString());
-        for (const auto& [name, idx] : get_camera_names()) {
-            (void)idx;
-            camera_name_box_->addItem(name, name);
-        }
-        // Make sure the saved name is selectable even if the device is
-        // currently unplugged: addItem it as a stand-alone entry so the
-        // user sees what they picked last time instead of silently
-        // reverting to "(default camera)".
-        const QString saved = s_.camera_name;
-        if (!saved.isEmpty() && camera_name_box_->findText(saved) < 0)
-            camera_name_box_->addItem(saved + QObject::tr(" (not connected)"), saved);
-        cam_row->addWidget(cam_lbl);
-        cam_row->addWidget(camera_name_box_, 1);
-        layout->addLayout(cam_row);
-        auto* cam_desc = new QLabel(QObject::tr(
-            "Camera used for LED-constellation position tracking. "
-            "\"(default camera)\" picks whatever AVFoundation considers "
-            "primary (usually the lid camera on MacBooks). A USB webcam "
-            "or PS Camera generally tracks better."));
-        cam_desc->setWordWrap(true);
-        cam_desc->setIndent(24);
-        cam_desc->setStyleSheet("color: gray; margin-bottom: 6px;");
-        layout->addWidget(cam_desc);
-        tie_setting(s_.camera_name, camera_name_box_);
-    }
-
     // Helper: a checkbox + a wrapped, indented, dim description label.
     // QCheckBox doesn't support setWordWrap natively, so multi-line
     // descriptions overflow horizontally when the dialog is embedded as
@@ -1468,6 +1428,70 @@ PSVRDialog::PSVRDialog()
                     "PnP solver lands in a follow-up commit, so today this "
                     "only records diagnostic data."),
         s_.enable_camera);
+
+    // Camera picker. Subordinate to the "Enable camera-based position
+    // tracking" checkbox above: indented under it (24 px matches the
+    // description-label indent the add_check_with_desc helper uses) and
+    // disabled when the checkbox is off. The picker is otherwise inert
+    // until the user actually enables camera tracking and restarts the
+    // tracker; before that the worker never runs.
+    //
+    // Populated from the shared enumerator (compat/camera-names) that
+    // tracker-easy and tracker-pt use, so the camera names match what
+    // the user sees in those other dialogs. The first entry is an
+    // explicit "(default camera)" option whose value is an empty string
+    // - that keeps the legacy [AVCaptureDevice defaultDeviceWithMediaType:]
+    // behavior available and is what an unmigrated ini file (no
+    // "camera-name" key) lands on. We tie by currentText, which is the
+    // localizedName for real entries and "" for the default placeholder,
+    // so the .ini value stays compatible with the cross-plugin
+    // "camera-name" convention.
+    {
+        auto* cam_row = new QHBoxLayout();
+        cam_row->setContentsMargins(24, 0, 0, 0);
+        auto* cam_lbl = new QLabel(QObject::tr("Camera"));
+        camera_name_box_ = new QComboBox();
+        camera_name_box_->addItem(QObject::tr("(default camera)"), QString());
+        for (const auto& [name, idx] : get_camera_names()) {
+            (void)idx;
+            camera_name_box_->addItem(name, name);
+        }
+        // Make sure the saved name is selectable even if the device is
+        // currently unplugged: addItem it as a stand-alone entry so the
+        // user sees what they picked last time instead of silently
+        // reverting to "(default camera)".
+        const QString saved = s_.camera_name;
+        if (!saved.isEmpty() && camera_name_box_->findText(saved) < 0)
+            camera_name_box_->addItem(saved + QObject::tr(" (not connected)"), saved);
+        cam_row->addWidget(cam_lbl);
+        cam_row->addWidget(camera_name_box_, 1);
+        layout->addLayout(cam_row);
+        auto* cam_desc = new QLabel(QObject::tr(
+            "Camera used for the LED-constellation tracker above. "
+            "\"(default camera)\" picks whatever AVFoundation considers "
+            "primary (usually the lid camera on MacBooks). A USB webcam "
+            "or PS Camera generally tracks better."));
+        cam_desc->setWordWrap(true);
+        cam_desc->setIndent(24);
+        cam_desc->setStyleSheet("color: gray; margin-bottom: 6px;");
+        layout->addWidget(cam_desc);
+        tie_setting(s_.camera_name, camera_name_box_);
+
+        // Greyed out unless the checkbox above is on. The description
+        // label fades alongside the combobox so the whole subordinate
+        // group reads as one disabled unit.
+        auto sync_enabled = [this, cam_lbl, cam_desc]() {
+            const bool on = camera_box_ && camera_box_->isChecked();
+            if (cam_lbl)         cam_lbl->setEnabled(on);
+            if (camera_name_box_) camera_name_box_->setEnabled(on);
+            if (cam_desc)        cam_desc->setEnabled(on);
+        };
+        sync_enabled();
+        if (camera_box_) {
+            QObject::connect(camera_box_, &QCheckBox::toggled,
+                             this, [sync_enabled](bool){ sync_enabled(); });
+        }
+    }
 
     buttons_ = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
     layout->addWidget(buttons_);
