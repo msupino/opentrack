@@ -339,19 +339,56 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
     // Snapshot prior state under the mutex, then release before the
     // OpenCV work. The state is only a handful of doubles so the copy
     // is cheap; we never hold the mutex across solvePnP.
-    cv::Vec3d prior_rvec, prior_tvec;
+    //
+    // Translation freshness gating: only reuse the last-accepted tvec
+    // if it's fresh (< kStalenessResetSec). Otherwise the user may
+    // have moved while we weren't tracking, and the cached value is
+    // worse than the cold-start "user at arm's length, centered"
+    // assumption further down.
+    //
+    // Rotation: we DON'T gate on freshness because the IMU runs at
+    // ~2 kHz independent of the camera, so the yaw/pitch/roll we got
+    // passed in is essentially current regardless of how long it's
+    // been since the last successful PnP. The IMU-derived rotation
+    // prior is therefore always preferable to either the cached
+    // state_rvec (which can be stale by definition if we lost
+    // tracking) or the previous fallback of (0, 0, 0) which silently
+    // told the visibility filter "head faces dead-ahead at the
+    // camera" and admitted only the front-facing 5 LEDs no matter
+    // which way the user was actually looking.
+    cv::Vec3d prior_tvec;
     bool      have_prior;
     {
         std::lock_guard<std::mutex> lk(s.state_mu);
         const bool fresh = s.state_valid &&
                            (steady_now_sec() - s.state_epoch_sec) < kStalenessResetSec;
         have_prior = fresh;
-        prior_rvec = have_prior ? s.state_rvec : cv::Vec3d(0, 0, 0);
         prior_tvec = have_prior ? s.state_tvec : cv::Vec3d(0, 0, kDefaultUserZCm);
     }
 
     const cv::Matx33d R = head_to_camera_rotation(yaw_rad, pitch_rad, roll_rad);
     const cv::Matx33d K = make_intrinsics(img_w, img_h, kDefaultHFOVDeg);
+
+    // Build the IMU rotation prior as a Rodrigues vector. R already
+    // expresses the head-to-camera transform that the visibility
+    // filter and projectPoints use directly, so prior_rvec just makes
+    // that same rotation available to the AP3P/RANSAC seed paths in
+    // the conventional (rvec, tvec) form. cv::Rodrigues round-trips
+    // any proper rotation; at yaw=pitch=roll=0 it produces (0, 0, pi)
+    // which is the head-to-camera 180-deg flip about Z encoded in
+    // R_flip (see head_to_camera_rotation comments). Solver behavior
+    // at the test case yaw=pitch=roll=0 is unchanged: AP3P inside the
+    // permutation-RANSAC loop runs with useExtrinsicGuess=false (it
+    // overwrites trial_rvec from scratch), and the downstream
+    // solvePnPRansac is seeded with best_rvec from the AP3P winner,
+    // not prior_rvec. Logging and any future direct-projection-seed
+    // path will see the correct value.
+    cv::Mat R_mat(3, 3, CV_64F);
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            R_mat.at<double>(i, j) = R(i, j);
+    cv::Vec3d prior_rvec;
+    cv::Rodrigues(R_mat, prior_rvec);
 
     // Cold-start improvement: if we don't have a fresh prior, derive
     // an initial (x, y) translation from the blob centroid instead of
