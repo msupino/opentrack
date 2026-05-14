@@ -87,31 +87,56 @@ static constexpr double RESULT_STALE_SEC = 0.5;
 static constexpr int PSVR_CAM_LOG_INTERVAL_FRAMES = 30;
 
 // Minimum / maximum blob area in pixels for the extractor. The PSVR
-// LEDs at ~60cm from a 720p camera image at ~70deg HFOV occupy roughly
-// 3-12 px diameter (7-100 px^2). The bounds reject single-pixel noise
-// (< 4 px^2) and very large bright areas like a ceiling lamp in frame
-// (> 500 px^2). Tuned empirically; adjust if a different camera or
-// lighting produces consistently under- or over-sized blobs.
-static constexpr double BLOB_MIN_AREA_PX = 4.0;
+// LEDs at ~60-100 cm from a 720p camera at ~70deg HFOV render as
+// roughly 3-25 px diameter (7-500 px^2). The lower bound rejects
+// single-pixel speckle and the morphological-opening leftovers that
+// would otherwise inflate the candidate set into the 20+ range; the
+// upper bound rejects bright spread-out areas like a ceiling lamp or
+// a window in frame. Was 4..500 px^2; the 4 lower bound let single-
+// pixel-cluster speckle through and bloated noisy environments to
+// 20+ blobs/frame, starving the permutation-RANSAC budget. 7 px^2 is
+// the smallest disc that survives MORPH_OPEN(3x3) reliably, so any
+// real LED ~3 px or larger still passes.
+static constexpr double BLOB_MIN_AREA_PX = 7.0;
 static constexpr double BLOB_MAX_AREA_PX = 500.0;
 
+// Minimum 4*PI*A/P^2 circularity. A geometric circle is 1.0; a real
+// PSVR LED (with a tiny bit of motion blur / partial saturation tail)
+// ranges 0.7-0.95. Highlights from room edges (monitor bezels, table
+// edges, glasses frames, the helmet's own metal trim) are elongated
+// and score 0.2-0.4. 0.55 keeps every real LED while dropping the
+// long-thin glints that ambient blue lighting paints onto desk
+// surfaces.
+static constexpr double BLOB_MIN_CIRCULARITY = 0.55;
+
 // Blob acceptance: a pixel is kept if EITHER
-//   (a) it's blue-dominant: (B - max(R,G)) > BLUENESS_THRESH and
-//       B > B_ABS_MIN   -- the typical daytime / lit-room case where
-//       PSVR LEDs saturate just the blue channel (B ~ 255, R,G < 128)
-//       while skin / room lighting rarely produces real blue-dominance.
+//   (a) it's pure deep blue in HSV with high saturation and value:
+//         H in [LED_H_MIN, LED_H_MAX]   (deep blue, around 240 deg)
+//         S >= LED_S_MIN                (real LED is S~255)
+//         V >= LED_V_MIN                (LEDs are eye-searing bright)
+//       This is the daytime/lit-room case where PSVR LEDs saturate
+//       just the blue channel and burnt-in monitor blue is dimmer
+//       (lower V) or paler (lower S).
 //   OR
-//   (b) it's fully saturated: min(R,G,B) > SAT_ABS_MIN   -- the dark-
-//       room case where auto-exposure cranks gain and the LEDs blow
-//       out to white (R=G=B=255). Blue-dominance would miss those
-//       entirely because max(R,G) catches up to B.
-// The two rules cover the two dominant lighting regimes. Noise stays
-// out because (a) demands blue-dominance and (b) demands all three
-// channels be near-saturated, which skin/clothing/light-gray surfaces
-// don't reach even under heavy exposure.
-static constexpr int BLUENESS_THRESH = 80;
-static constexpr int B_ABS_MIN       = 160;
-static constexpr int SAT_ABS_MIN     = 220;
+//   (b) it's fully white-saturated: min(R,G,B) >= WHITE_ABS_MIN --
+//       the dark-room case where AVFoundation auto-exposure cranks
+//       gain and the LEDs blow out to white (R=G=B=255). The HSV
+//       blue gate would miss those because S drops to ~0 when all
+//       channels saturate. Threshold tightened from 220 to 235 so
+//       only genuinely blown-out highlights (the LEDs themselves)
+//       qualify, not just a desk lamp's halo.
+//
+// LED_H is in OpenCV's 0..179 scale (degrees / 2). 240 deg blue
+// maps to 120; we admit 100..125 which covers from cyan-leaning blue
+// (~200 deg) to indigo (~250 deg) without admitting magenta or
+// teal. LED_S=180 floor means anything below ~70% saturation
+// is rejected: sky-blue UI elements, washed-out monitor pixels,
+// and pale-blue clothing all sit at S < 150 even when bright.
+static constexpr int LED_H_MIN     = 100;
+static constexpr int LED_H_MAX     = 125;
+static constexpr int LED_S_MIN     = 180;
+static constexpr int LED_V_MIN     = 200;
+static constexpr int WHITE_ABS_MIN = 235;
 
 static double now_sec() {
     return std::chrono::duration<double>(
@@ -166,8 +191,8 @@ struct Worker::Impl {
 
     // Reusable work buffers; owned by the delegate thread.
     cv::Mat bgra_view;      // zero-copy wrapper of the incoming frame
-    cv::Mat channels_[4];
-    cv::Mat blueness;
+    cv::Mat bgr_owned;      // owned BGR copy (lives past IOSurface unlock)
+    cv::Mat hsv;            // HSV of bgr_owned for color-based gating
     cv::Mat mask;
 
     // Preview buffer: BGR annotated copy of the latest capture, with
@@ -461,32 +486,36 @@ static void process_frame(Worker::Impl* s, CVPixelBufferRef buf) {
 
     // Zero-copy wrap of the BGRA plane. cv::Mat doesn't take ownership
     // so the IOSurface stays valid as long as we hold the pixel-buffer
-    // lock. We do NOT modify bgra_view; we derive single-channel
-    // temporaries from it.
+    // lock. We do NOT modify bgra_view; we derive owned copies from it.
     cv::Mat bgra(h, w, CV_8UC4, base, stride);
 
-    // Split into B, G, R, A. OpenCV does a per-plane memcpy here —
-    // unavoidable for channelwise ops but fast; 720p BGRA is ~3.5 MB.
-    cv::split(bgra, s->channels_);
+    // Convert to an OpenCV-owned BGR buffer immediately. After this
+    // line we no longer depend on the IOSurface and can unlock it.
+    // We also need a BGR copy below for the HSV conversion and for
+    // overlay drawing, so doing it once up-front is strictly cheaper
+    // than the previous arrangement (split-then-copy-later).
+    cv::cvtColor(bgra, s->bgr_owned, cv::COLOR_BGRA2BGR);
 
-    // Blue-dominant branch: blueness = max(0, B - max(R,G)), then
-    //   mask_blue = (blueness > BLUENESS_THRESH) AND (B > B_ABS_MIN)
-    cv::Mat maxRG;
-    cv::max(s->channels_[2], s->channels_[1], maxRG);   // [2]=R, [1]=G
-    cv::subtract(s->channels_[0], maxRG, s->blueness);  // saturating subtract
-    cv::Mat bright, mask_blue;
-    cv::threshold(s->blueness, mask_blue, BLUENESS_THRESH, 255, cv::THRESH_BINARY);
-    cv::threshold(s->channels_[0], bright, B_ABS_MIN, 255, cv::THRESH_BINARY);
-    cv::bitwise_and(mask_blue, bright, mask_blue);
+    CVPixelBufferUnlockBaseAddress(buf, kCVPixelBufferLock_ReadOnly);
 
-    // Saturated-bright branch: mask_sat = min(R,G,B) > SAT_ABS_MIN
-    // (all three channels near 255 -> blown-out LED in a dark room).
-    cv::Mat minRG, minAll, mask_sat;
-    cv::min(s->channels_[2], s->channels_[1], minRG);
-    cv::min(minRG, s->channels_[0], minAll);
-    cv::threshold(minAll, mask_sat, SAT_ABS_MIN, 255, cv::THRESH_BINARY);
+    // HSV-based deep-blue gate. inRange does H, S, and V in one pass.
+    cv::cvtColor(s->bgr_owned, s->hsv, cv::COLOR_BGR2HSV);
+    cv::Mat mask_blue;
+    cv::inRange(s->hsv,
+                cv::Scalar(LED_H_MIN, LED_S_MIN, LED_V_MIN),
+                cv::Scalar(LED_H_MAX, 255,       255),
+                mask_blue);
 
-    // Union: a blob qualifies under either regime.
+    // White-saturated branch: every channel near 255. Catches LEDs
+    // that have been gained up to white by auto-exposure in dark
+    // rooms, which the HSV blue gate would reject because S falls
+    // off as all channels saturate.
+    cv::Mat mask_sat;
+    cv::inRange(s->bgr_owned,
+                cv::Scalar(WHITE_ABS_MIN, WHITE_ABS_MIN, WHITE_ABS_MIN),
+                cv::Scalar(255, 255, 255),
+                mask_sat);
+
     cv::bitwise_or(mask_blue, mask_sat, s->mask);
 
     // Small morphological opening to kill speckle noise, then contour find.
@@ -496,29 +525,27 @@ static void process_frame(Worker::Impl* s, CVPixelBufferRef buf) {
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(s->mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
 
-    // Per-contour centroid + area.
+    // Per-contour centroid + area + circularity gate.
     std::vector<cv::Point2d> blobs;
     blobs.reserve(contours.size());
     for (const auto& c : contours) {
         const double area = cv::contourArea(c);
         if (area < BLOB_MIN_AREA_PX || area > BLOB_MAX_AREA_PX) continue;
+        const double perim = cv::arcLength(c, /*closed=*/true);
+        if (perim <= 0) continue;
+        const double circularity = 4.0 * CV_PI * area / (perim * perim);
+        if (circularity < BLOB_MIN_CIRCULARITY) continue;
         const cv::Moments m = cv::moments(c);
         if (m.m00 <= 0) continue;
         blobs.emplace_back(m.m10 / m.m00, m.m01 / m.m00);
     }
 
-    // Copy the frame into an OpenCV-owned BGR buffer BEFORE unlocking
-    // the IOSurface. The downstream overlay-drawing block needs to
-    // read pixel data, but `bgra` is just a zero-copy view of the
-    // CVPixelBuffer; once we unlock it the AVCaptureSession is free
-    // to recycle that memory for the next frame, and reading bgra
-    // afterwards is a use-after-free (corrupted preview, occasional
-    // segfault). Allocating `vis` here keeps the rest of the
-    // function safe and lets us drop the lock immediately.
-    cv::Mat vis;
-    cv::cvtColor(bgra, vis, cv::COLOR_BGRA2BGR);
-
-    CVPixelBufferUnlockBaseAddress(buf, kCVPixelBufferLock_ReadOnly);
+    // The overlay-drawing block below mutates a BGR copy of the
+    // capture in-place. Use the owned bgr_owned we already built (the
+    // IOSurface is long since unlocked); clone so the next frame's
+    // process_frame can reuse bgr_owned without smearing overlays
+    // from this frame across it.
+    cv::Mat vis = s->bgr_owned.clone();
 
     // Hand off to constellation stage. It may return no_solution; in
     // that case we still record the blob count so the user can tell
