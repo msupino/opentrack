@@ -68,6 +68,17 @@ public:
     // returns false immediately without side effects.
     bool start();
 
+    // Optional camera-name preference, written by the plugin from the
+    // settings dialog BEFORE start() is called. Empty string keeps the
+    // legacy "AVFoundation default" behavior (lid camera on MacBooks);
+    // a non-empty value is matched against AVCaptureDevice uniqueID
+    // first, then localizedName; an unmatched value also falls back to
+    // the default. Storage is just a std::string; the only writer is
+    // the Qt UI thread before start(), the only reader is start()
+    // itself, so no synchronization beyond happens-before from the
+    // single-shot call ordering is required.
+    void set_desired_camera_name(const std::string& s);
+
     // Idempotent. Always safe to call.
     void stop();
 

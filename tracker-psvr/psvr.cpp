@@ -18,12 +18,17 @@
 #include "psvr_camera.h"
 #endif
 
+#include "compat/camera-names.hpp"
+#include "options/tie.hpp"
+
 #include <cmath>
 #include <cstdlib>      // setenv/unsetenv (constellation-log toggle bridge)
 #include <cstring>
 #include <QDebug>
 #include <QCheckBox>
+#include <QComboBox>
 #include <QDialogButtonBox>
+#include <QHBoxLayout>
 #include <QImage>
 #include <QLabel>
 #include <QPixmap>
@@ -406,6 +411,12 @@ module_status PSVRTracker::start_tracker(QFrame* frame)
 #ifdef PSVR_HAS_CAMERA
     if (s_.enable_camera) {
         camera_worker_ = std::make_unique<psvr_cam::Worker>();
+        // Push the dialog-selected camera name to the worker BEFORE
+        // start(): the AVFoundation device lookup happens inside
+        // start() and reads desired_camera_name_ exactly once. Empty
+        // string keeps the legacy defaultDeviceWithMediaType: path.
+        camera_worker_->set_desired_camera_name(
+            QString(s_.camera_name).toStdString());
         if (!camera_worker_->start()) {
             qDebug() << "[psvr] camera worker failed to start; position will be zero";
             camera_worker_.reset();
@@ -1374,6 +1385,47 @@ PSVRDialog::PSVRDialog()
         "baked-in drift. Press \"Re-calibrate\" later to redo it."));
     header->setWordWrap(true);
     layout->addWidget(header);
+
+    // Camera picker at the top of the dialog. Populated from the same
+    // shared enumerator (compat/camera-names) that tracker-easy and
+    // tracker-pt use, so the names match what the user sees in those
+    // other dialogs. The first entry is an explicit "(default camera)"
+    // option whose value is an empty string - that keeps the legacy
+    // [AVCaptureDevice defaultDeviceWithMediaType:] behavior available
+    // and is what an unmigrated ini file (no "camera-name" key) lands
+    // on. We tie by currentText, which is the localizedName for real
+    // entries and "" for the default placeholder, so the .ini value
+    // stays compatible with the cross-plugin "camera-name" convention.
+    {
+        auto* cam_row = new QHBoxLayout();
+        auto* cam_lbl = new QLabel(QObject::tr("Camera"));
+        camera_name_box_ = new QComboBox();
+        camera_name_box_->addItem(QObject::tr("(default camera)"), QString());
+        for (const auto& [name, idx] : get_camera_names()) {
+            (void)idx;
+            camera_name_box_->addItem(name, name);
+        }
+        // Make sure the saved name is selectable even if the device is
+        // currently unplugged: addItem it as a stand-alone entry so the
+        // user sees what they picked last time instead of silently
+        // reverting to "(default camera)".
+        const QString saved = s_.camera_name;
+        if (!saved.isEmpty() && camera_name_box_->findText(saved) < 0)
+            camera_name_box_->addItem(saved + QObject::tr(" (not connected)"), saved);
+        cam_row->addWidget(cam_lbl);
+        cam_row->addWidget(camera_name_box_, 1);
+        layout->addLayout(cam_row);
+        auto* cam_desc = new QLabel(QObject::tr(
+            "Camera used for LED-constellation position tracking. "
+            "\"(default camera)\" picks whatever AVFoundation considers "
+            "primary (usually the lid camera on MacBooks). A USB webcam "
+            "or PS Camera generally tracks better."));
+        cam_desc->setWordWrap(true);
+        cam_desc->setIndent(24);
+        cam_desc->setStyleSheet("color: gray; margin-bottom: 6px;");
+        layout->addWidget(cam_desc);
+        tie_setting(s_.camera_name, camera_name_box_);
+    }
 
     // Helper: a checkbox + a wrapped, indented, dim description label.
     // QCheckBox doesn't support setWordWrap natively, so multi-line

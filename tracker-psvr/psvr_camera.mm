@@ -19,10 +19,26 @@
  *
  * Notes on camera selection
  * -------------------------
- * We ask AVFoundation for the first "default" built-in video device,
- * which on MacBooks is the lid camera. A user-facing picker is a follow
- * -up; the current design supports it trivially by storing a uniqueID
- * in settings and using deviceWithUniqueID: at start() time.
+ * The plugin exposes a "Camera" dropdown in the settings dialog
+ * populated from compat/camera-names. The chosen name is pushed to
+ * this worker via set_desired_camera_name() before start() runs. At
+ * start() time we resolve it against the live AVCaptureDevice list:
+ *
+ *   1. If a non-empty preference is set, try to match by uniqueID
+ *      first (covers future ini files written by a uniqueID-aware
+ *      picker), then by localizedName (covers the current picker,
+ *      which stores the human-readable name returned by
+ *      compat/camera-names).
+ *   2. If no preference is set OR no match is found, fall back to
+ *      [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo],
+ *      i.e. the legacy behavior. That's also what an empty ini
+ *      key persists as, so users on an unmigrated profile get the
+ *      same camera they had before this change.
+ *
+ * The enumeration goes through AVCaptureDeviceDiscoverySession because
+ * the older devicesWithMediaType: API is deprecated on macOS 11+ and
+ * the discovery session pulls in external USB cameras (deskViewCamera,
+ * external) that the deprecated API misses on Apple Silicon.
  *
  * Notes on permissions
  * --------------------
@@ -163,6 +179,12 @@ struct Worker::Impl {
     // accepted pose for prior-based matching and the optional debug
     // log file. One per Worker = one per tracker session.
     psvr_constellation::SolverState solver_state;
+
+    // User-selected camera (localizedName or uniqueID; matched both
+    // ways at start time). Empty = legacy default-device behavior.
+    // Written from the Qt UI thread before start(); read only in
+    // start() on the camera thread, never afterwards.
+    std::string desired_camera_name;
 };
 
 Worker::Worker() : impl_(std::make_unique<Impl>()) {}
@@ -170,6 +192,10 @@ Worker::Worker() : impl_(std::make_unique<Impl>()) {}
 Worker::~Worker() { stop(); }
 
 bool Worker::is_running() const { return impl_->running.load(); }
+
+void Worker::set_desired_camera_name(const std::string& s) {
+    impl_->desired_camera_name = s;
+}
 
 void Worker::set_rotation_prior(double yaw, double pitch, double roll) {
     impl_->yaw_rad.store(yaw, std::memory_order_relaxed);
@@ -251,14 +277,93 @@ bool Worker::fetch_preview_rgb(std::vector<uint8_t>* out,
     return true;
 }
 
+// Resolve the user's camera preference to a concrete AVCaptureDevice.
+// Matching strategy (uniqueID > localizedName > default) is documented
+// in the file header. Returns nil only if there is no usable video
+// camera attached at all.
+static AVCaptureDevice* pick_camera(const std::string& desired)
+{
+    AVCaptureDevice* fallback =
+        [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
+
+    if (desired.empty()) {
+        if (fallback) {
+            std::fprintf(stderr,
+                "[psvr-cam] using default video device: %s (%s)\n",
+                fallback.localizedName.UTF8String,
+                fallback.uniqueID.UTF8String);
+        }
+        return fallback;
+    }
+
+    NSString* want = [NSString stringWithUTF8String:desired.c_str()];
+
+    // AVCaptureDeviceDiscoverySession with a fairly inclusive device-
+    // type list. builtInWideAngleCamera covers the FaceTime lid cam,
+    // `external` (macOS 14+) covers USB webcams and the PS Camera,
+    // deskViewCamera covers Continuity Camera "Desk View" on macOS
+    // 13+. Older systems fall through with whatever subset of the
+    // list is available; AVCaptureDeviceDiscoverySession ignores
+    // unknown device-type identifiers gracefully.
+    NSMutableArray<AVCaptureDeviceType>* types = [NSMutableArray array];
+    [types addObject:AVCaptureDeviceTypeBuiltInWideAngleCamera];
+    if (@available(macOS 14.0, *)) {
+        [types addObject:AVCaptureDeviceTypeExternal];
+    } else {
+        // Pre-macOS 14, external USB cameras (PS Camera, Logitech,
+        // etc.) come through as AVCaptureDeviceTypeExternalUnknown.
+        // Use the literal NSString to keep building on SDKs that
+        // have already removed the symbol from their headers.
+        [types addObject:(AVCaptureDeviceType)@"AVCaptureDeviceTypeExternalUnknown"];
+    }
+    if (@available(macOS 13.0, *)) {
+        [types addObject:AVCaptureDeviceTypeDeskViewCamera];
+    }
+
+    AVCaptureDeviceDiscoverySession* ds =
+        [AVCaptureDeviceDiscoverySession
+            discoverySessionWithDeviceTypes:types
+                                  mediaType:AVMediaTypeVideo
+                                   position:AVCaptureDevicePositionUnspecified];
+
+    AVCaptureDevice* by_uid  = nil;
+    AVCaptureDevice* by_name = nil;
+    for (AVCaptureDevice* d in ds.devices) {
+        if (!by_uid  && [d.uniqueID      isEqualToString:want]) by_uid  = d;
+        if (!by_name && [d.localizedName isEqualToString:want]) by_name = d;
+    }
+
+    if (by_uid) {
+        std::fprintf(stderr,
+            "[psvr-cam] matched preferred camera by uniqueID: %s (%s)\n",
+            by_uid.localizedName.UTF8String, by_uid.uniqueID.UTF8String);
+        return by_uid;
+    }
+    if (by_name) {
+        std::fprintf(stderr,
+            "[psvr-cam] matched preferred camera by name: %s (%s)\n",
+            by_name.localizedName.UTF8String, by_name.uniqueID.UTF8String);
+        return by_name;
+    }
+
+    std::fprintf(stderr,
+        "[psvr-cam] preferred camera \"%s\" not found among %lu device(s); "
+        "falling back to default\n",
+        desired.c_str(), (unsigned long)ds.devices.count);
+    if (fallback) {
+        std::fprintf(stderr,
+            "[psvr-cam] using default video device: %s (%s)\n",
+            fallback.localizedName.UTF8String,
+            fallback.uniqueID.UTF8String);
+    }
+    return fallback;
+}
+
 bool Worker::start() {
     if (impl_->running.load()) return true;
 
     @autoreleasepool {
-        // Pick the default built-in video camera. A follow-up can expose
-        // a picker in the settings dialog and remember a uniqueID.
-        AVCaptureDevice* dev =
-            [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
+        AVCaptureDevice* dev = pick_camera(impl_->desired_camera_name);
         if (!dev) {
             std::fprintf(stderr, "[psvr-cam] no camera device available\n");
             return false;

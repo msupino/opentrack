@@ -19,6 +19,7 @@
 #include <QObject>
 #include <QIcon>
 #include <QCheckBox>
+#include <QComboBox>
 #include <QDialogButtonBox>
 #include <QFrame>
 #include <QLabel>
@@ -69,6 +70,14 @@ struct psvr_settings : opts {
     value<bool>    keepalive_enable;
     value<QString> keepalive_cmd;
     value<int>     keepalive_interval_s;
+    // Which camera the constellation worker should open. Empty means
+    // "use the AVFoundation default" (legacy behavior: lid camera on
+    // MacBooks). The key "camera-name" matches the convention used by
+    // tracker-easy and tracker-pt so a future shared cam picker UI can
+    // operate on the same ini shape across plugins. Stores the
+    // localizedName as reported by compat/camera-names; the worker
+    // resolves that to an AVCaptureDevice at start() time.
+    value<QString> camera_name;
     psvr_settings() :
         opts("psvr-tracker"),
         // Default OFF: turning the mirror on is what triggers macOS's
@@ -81,7 +90,8 @@ struct psvr_settings : opts {
         enable_camera(b, "enable-camera", false),
         keepalive_enable(b, "keepalive-enable", false),
         keepalive_cmd(b, "keepalive-cmd", QStringLiteral("0x1F")),
-        keepalive_interval_s(b, "keepalive-interval-s", 60)
+        keepalive_interval_s(b, "keepalive-interval-s", 60),
+        camera_name(b, "camera-name", {})
     {}
 };
 
@@ -488,6 +498,7 @@ private:
     QCheckBox* mirror_box_{nullptr};
     QCheckBox* diag_log_box_{nullptr};
     QCheckBox* camera_box_{nullptr};
+    QComboBox* camera_name_box_{nullptr};
     // Held as a member so set_buttons_visible() can hide it when this
     // dialog is rendered as an embedded tab inside the global Options
     // dialog (which provides its own OK/Cancel and would otherwise stack
