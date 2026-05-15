@@ -89,9 +89,15 @@ public:
     // blobs:         image-space centroids in pixels
     // img_w, img_h:  frame dimensions (for camera-intrinsics default)
     // yaw/pitch/roll_rad: IMU rotation prior in radians.
+    // hfov_deg:      camera horizontal field of view, in degrees,
+    //                used to build the pinhole intrinsics. Defaults
+    //                to 70 deg when omitted, matching the legacy
+    //                hard-coded value (so unit tests and any caller
+    //                that doesn't supply HFOV behaves as before).
     Result solve(const std::vector<cv::Point2d>& blobs,
                  int img_w, int img_h,
-                 double yaw_rad, double pitch_rad, double roll_rad);
+                 double yaw_rad, double pitch_rad, double roll_rad,
+                 double hfov_deg = 70.0);
 
     // Forward-declared and defined in the .cpp; Impl needs to be
     // declared at struct-level visibility (not nested-private) so

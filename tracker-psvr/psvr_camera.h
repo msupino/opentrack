@@ -91,6 +91,17 @@ public:
     // single-shot call ordering is required.
     void set_desired_camera_name(const std::string& s);
 
+    // Camera horizontal field of view in degrees. Fed into the
+    // constellation solver's pinhole intrinsics so solvePnP recovers
+    // the correct Z translation regardless of which webcam the user
+    // selected. Range 40..130 (anything outside that is implausible
+    // for a head-tracking webcam); the dialog clamps before calling
+    // here, but the worker re-clamps defensively too. Thread-safe:
+    // backed by std::atomic<double>, so callers can hot-apply
+    // changes from the Qt UI thread while the camera worker reads
+    // on its dispatch queue. Default if never set is 70 deg.
+    void set_hfov_deg(double hfov_deg);
+
     // Idempotent. Always safe to call.
     void stop();
 

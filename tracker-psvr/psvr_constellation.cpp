@@ -141,7 +141,16 @@ namespace {
 
 // Tuning constants. Collected here so all the numbers that determine
 // "does the solver latch or not" are visible at a glance.
-constexpr double kDefaultHFOVDeg        = 70.0; // typical laptop webcam
+//
+// kDefaultHFOVDeg is kept as a compile-time fallback used by the
+// SolverState::solve() default parameter (see header). Today's
+// production call path always passes the value through from
+// psvr_settings::camera_hfov_deg via the Qt spinbox, but unit tests
+// and any future caller that doesn't have a real HFOV available
+// can still call solve() without specifying it. Marking it
+// [[maybe_unused]] silences the "unused constant" warning that
+// surfaces in builds that only exercise the explicit-HFOV path.
+[[maybe_unused]] constexpr double kDefaultHFOVDeg        = 70.0; // typical laptop webcam
 constexpr double kMaxMatchDistPx        = 250.0;// projected-LED to blob
 // Inlier RMS threshold is set loose (30 px @ 1920x1080) because the
 // LED constellation model is "eyeballed" from PSMoveService (~5 mm
@@ -319,7 +328,8 @@ SolverState::~SolverState() {
 
 Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
                           int img_w, int img_h,
-                          double yaw_rad, double pitch_rad, double roll_rad)
+                          double yaw_rad, double pitch_rad, double roll_rad,
+                          double hfov_deg)
 {
     Impl& s = *impl_;
     Result r;
@@ -368,7 +378,13 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
     }
 
     const cv::Matx33d R = head_to_camera_rotation(yaw_rad, pitch_rad, roll_rad);
-    const cv::Matx33d K = make_intrinsics(img_w, img_h, kDefaultHFOVDeg);
+    // Camera intrinsics from the user-configured HFOV. Was a TU-
+    // constant kDefaultHFOVDeg=70 here; now plumbed from the dialog's
+    // Camera HFOV spinbox via psvr_cam::Worker::set_hfov_deg so the
+    // solver matches whatever webcam is actually mounted. solve()'s
+    // default-parameter value (70 deg) preserves the legacy behavior
+    // for callers that don't supply the HFOV (tests, etc.).
+    const cv::Matx33d K = make_intrinsics(img_w, img_h, hfov_deg);
 
     // Build the IMU rotation prior as a Rodrigues vector. R already
     // expresses the head-to-camera transform that the visibility

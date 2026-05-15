@@ -78,6 +78,15 @@ struct psvr_settings : opts {
     // localizedName as reported by compat/camera-names; the worker
     // resolves that to an AVCaptureDevice at start() time.
     value<QString> camera_name;
+    // Horizontal field of view (degrees) of the camera selected
+    // above. Fed into the PnP solver's pinhole intrinsics so the
+    // recovered Z translation matches reality. Different webcams
+    // have wildly different FOVs (UGREEN ~80, FaceTime HD ~78,
+    // PS Camera ~75, GoPro ~120, typical wide-angle ~110) and an
+    // FOV mismatch makes solvePnP land at the wrong Z and trip
+    // the z-sanity gate. Default 70 reproduces the legacy
+    // hard-coded behavior so unmigrated profiles are unaffected.
+    value<double>  camera_hfov_deg;
     psvr_settings() :
         opts("psvr-tracker"),
         // Default OFF: turning the mirror on is what triggers macOS's
@@ -91,7 +100,8 @@ struct psvr_settings : opts {
         keepalive_enable(b, "keepalive-enable", false),
         keepalive_cmd(b, "keepalive-cmd", QStringLiteral("0x1F")),
         keepalive_interval_s(b, "keepalive-interval-s", 60),
-        camera_name(b, "camera-name", {})
+        camera_name(b, "camera-name", {}),
+        camera_hfov_deg(b, "camera-hfov-deg", 70.0)
     {}
 };
 
@@ -499,6 +509,11 @@ private:
     QCheckBox* diag_log_box_{nullptr};
     QCheckBox* camera_box_{nullptr};
     QComboBox* camera_name_box_{nullptr};
+    // Camera horizontal-FOV spinbox; subordinate to camera_box_.
+    // Wired to s_.camera_hfov_deg via tie_setting; value applied to
+    // the running camera worker on (re)start and (when wired) on
+    // valueChanged. Defined in psvr.cpp's PSVRDialog ctor.
+    class QDoubleSpinBox* hfov_box_{nullptr};
     // Held as a member so set_buttons_visible() can hide it when this
     // dialog is rendered as an embedded tab inside the global Options
     // dialog (which provides its own OK/Cancel and would otherwise stack

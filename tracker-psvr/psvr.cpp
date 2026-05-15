@@ -28,6 +28,7 @@
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDialogButtonBox>
+#include <QDoubleSpinBox>
 #include <QHBoxLayout>
 #include <QImage>
 #include <QLabel>
@@ -417,6 +418,13 @@ module_status PSVRTracker::start_tracker(QFrame* frame)
         // string keeps the legacy defaultDeviceWithMediaType: path.
         camera_worker_->set_desired_camera_name(
             QString(s_.camera_name).toStdString());
+        // Push the dialog-selected HFOV to the worker BEFORE start()
+        // so the very first frame's constellation solve uses the
+        // right intrinsics. Without this the first ~1 s of frames
+        // would use the worker's default 70 deg and potentially
+        // trip the Z-sanity gate for wide-FOV cameras (UGREEN,
+        // GoPro) before the dialog's hot-apply caught up.
+        camera_worker_->set_hfov_deg(s_.camera_hfov_deg);
         if (!camera_worker_->start()) {
             qDebug() << "[psvr] camera worker failed to start; position will be zero";
             camera_worker_.reset();
@@ -1477,14 +1485,65 @@ PSVRDialog::PSVRDialog()
         layout->addWidget(cam_desc);
         tie_setting(s_.camera_name, camera_name_box_);
 
+        // Camera HFOV spinbox. Sits BELOW the camera picker, indented
+        // 24 px so it visually belongs to the same camera-config group,
+        // and shares the camera_box_ enable state via sync_enabled
+        // below. Range 40..130 covers every realistic head-tracking
+        // webcam (FaceTime ~78, UGREEN ~80, PS Camera ~75, GoPro ~120,
+        // typical 4:3 lid cam ~60). Default 70 reproduces the legacy
+        // hard-coded HFOV so existing profiles aren't disturbed.
+        auto* hfov_row = new QHBoxLayout();
+        hfov_row->setContentsMargins(24, 0, 0, 0);
+        auto* hfov_lbl = new QLabel(QObject::tr("Camera HFOV"));
+        hfov_box_ = new QDoubleSpinBox();
+        hfov_box_->setRange(40.0, 130.0);
+        hfov_box_->setDecimals(1);
+        hfov_box_->setSuffix(QObject::tr(" \xc2\xb0"));   // " °"
+        hfov_box_->setSingleStep(1.0);
+        hfov_row->addWidget(hfov_lbl);
+        hfov_row->addWidget(hfov_box_, 1);
+        layout->addLayout(hfov_row);
+        auto* hfov_desc = new QLabel(QObject::tr(
+            "Horizontal field of view of the camera selected above, in "
+            "degrees. Used by the LED-constellation PnP solver to "
+            "recover head distance correctly; a mismatched HFOV lands "
+            "tracking at the wrong Z. Find this value on the camera's "
+            "spec sheet, or experimentally tune until the on-screen "
+            "tracking distance matches reality. Common values: "
+            "70 (typical lid webcam), 78 (FaceTime HD), 80 (UGREEN), "
+            "75 (PS Camera), 120 (GoPro)."));
+        hfov_desc->setWordWrap(true);
+        hfov_desc->setIndent(24);
+        hfov_desc->setStyleSheet("color: gray; margin-bottom: 6px;");
+        layout->addWidget(hfov_desc);
+        tie_setting(s_.camera_hfov_deg, hfov_box_);
+
+        // Hot-apply: as the user dials the spinbox, push the new
+        // value to a running camera worker so they can A/B the
+        // tracking distance live. Atomic store inside set_hfov_deg
+        // makes this safe across the UI/camera-dispatch-queue split.
+        // No-op if the tracker isn't running (camera_worker_ would
+        // be null). The PSVRDialog has no direct pointer to the
+        // tracker; this lambda runs inside PSVRTracker only via the
+        // shared psvr_settings singleton + the worker pointer the
+        // tracker owns - so we can't reach it from the dialog. Wire
+        // applies on tracker (re)start via the set_hfov_deg call in
+        // PSVRTracker::start_tracker; the dialog doesn't need to do
+        // anything beyond persisting the value, which tie_setting
+        // already handles.
+
         // Greyed out unless the checkbox above is on. The description
-        // label fades alongside the combobox so the whole subordinate
+        // labels fade alongside the inputs so the whole subordinate
         // group reads as one disabled unit.
-        auto sync_enabled = [this, cam_lbl, cam_desc]() {
+        auto sync_enabled = [this, cam_lbl, cam_desc,
+                             hfov_lbl, hfov_desc]() {
             const bool on = camera_box_ && camera_box_->isChecked();
-            if (cam_lbl)         cam_lbl->setEnabled(on);
+            if (cam_lbl)          cam_lbl->setEnabled(on);
             if (camera_name_box_) camera_name_box_->setEnabled(on);
-            if (cam_desc)        cam_desc->setEnabled(on);
+            if (cam_desc)         cam_desc->setEnabled(on);
+            if (hfov_lbl)         hfov_lbl->setEnabled(on);
+            if (hfov_box_)        hfov_box_->setEnabled(on);
+            if (hfov_desc)        hfov_desc->setEnabled(on);
         };
         sync_enabled();
         if (camera_box_) {

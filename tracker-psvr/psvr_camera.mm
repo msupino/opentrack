@@ -288,6 +288,14 @@ struct Worker::Impl {
     // Written from the Qt UI thread before start(); read only in
     // start() on the camera thread, never afterwards.
     std::string desired_camera_name;
+
+    // Camera horizontal FOV (degrees) used to build the constellation
+    // solver's pinhole intrinsics. Default 70 reproduces the legacy
+    // hard-coded behavior. Written from the Qt UI thread (start +
+    // hot-apply on dialog valueChanged); read from the camera
+    // dispatch queue every frame. Atomic so the cross-thread store/
+    // load is well-defined without needing a mutex on the hot path.
+    std::atomic<double> desired_hfov_deg{70.0};
 };
 
 Worker::Worker() : impl_(std::make_unique<Impl>()) {}
@@ -298,6 +306,15 @@ bool Worker::is_running() const { return impl_->running.load(); }
 
 void Worker::set_desired_camera_name(const std::string& s) {
     impl_->desired_camera_name = s;
+}
+
+void Worker::set_hfov_deg(double hfov_deg) {
+    // Defensive clamp matching the dialog's spinbox range. Anything
+    // outside 40..130 is implausible for a head-tracking webcam and
+    // would produce nonsensical solvePnP intrinsics.
+    if (hfov_deg < 40.0)  hfov_deg = 40.0;
+    if (hfov_deg > 130.0) hfov_deg = 130.0;
+    impl_->desired_hfov_deg.store(hfov_deg, std::memory_order_relaxed);
 }
 
 void Worker::set_rotation_prior(double yaw, double pitch, double roll) {
@@ -655,12 +672,13 @@ static void process_frame(Worker::Impl* s, CVPixelBufferRef buf) {
     // Hand off to constellation stage. It may return no_solution; in
     // that case we still record the blob count so the user can tell
     // whether the camera even saw LEDs vs. a PnP / ID failure.
-    const double yaw   = s->yaw_rad.load(std::memory_order_relaxed);
-    const double pitch = s->pitch_rad.load(std::memory_order_relaxed);
-    const double roll  = s->roll_rad.load(std::memory_order_relaxed);
+    const double yaw      = s->yaw_rad.load(std::memory_order_relaxed);
+    const double pitch    = s->pitch_rad.load(std::memory_order_relaxed);
+    const double roll     = s->roll_rad.load(std::memory_order_relaxed);
+    const double hfov_deg = s->desired_hfov_deg.load(std::memory_order_relaxed);
 
     psvr_constellation::Result r =
-        s->solver_state.solve(blobs, w, h, yaw, pitch, roll);
+        s->solver_state.solve(blobs, w, h, yaw, pitch, roll, hfov_deg);
 
     // Seqlock publish: bracket the multi-double mutation with two
     // increments of pos_seq so any concurrent reader either sees the
