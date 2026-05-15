@@ -38,7 +38,10 @@
  * +Z = back of head (right-handed; cross(+X, +Y) = +Z). Forward-where-
  * face-points is -Z. The model coordinates differ from PSMoveService's
  * original by a Z-sign flip - see the comment on kLEDModel - because
- * cv::solvePnP needs a right-handed model frame.
+ * cv::solvePnP needs a right-handed model frame. The per-LED outward-
+ * normal table (kLEDNormals) is derived from (P - head_centre) with
+ * head_centre = (0, 0, 12) cm, i.e. ~12 cm behind the visor centre
+ * (roughly between the ears), matching PSVRTracker's convention.
  *
  * When the user faces the camera with zero IMU rotation, the head-to-
  * camera flip is 180 deg around Z: user right (+X_head) becomes camera
@@ -107,17 +110,42 @@ namespace psvr_constellation {
 //   6  lower left front
 //   7  right rear (strap, near base of skull)
 //   8  left rear  (strap, near base of skull)
+// Numbers from PSVRTracker (HipsterSloth) MorpheusHMD.cpp's
+// getTrackingShape(). Previously rounded approximations (off by ~10%
+// on the front LEDs and ~13% on the rear strap) were good enough for
+// blob detection but degraded PnP RMS.
 static const std::array<cv::Point3d, NUM_LEDS> kLEDModel = {{
-    { 0.0,  0.0,   0.0},
-    { 8.0,  4.5,   2.5},
-    { 9.0,  0.0,  10.0},
-    { 8.0, -4.5,   2.5},
-    {-8.0,  4.5,   2.5},
-    {-9.0,  0.0,  10.0},
-    {-8.0, -4.5,   2.5},
-    { 6.0, -1.0,  24.0},
-    {-6.0, -1.0,  24.0},
+    { 0.00,  0.00,   0.00},
+    { 7.25,  4.05,   3.75},
+    { 9.05,  0.00,   9.65},
+    { 7.25, -4.05,   3.75},
+    {-7.25,  4.05,   3.75},
+    {-9.05,  0.00,   9.65},
+    {-7.25, -4.05,   3.75},
+    { 5.65, -1.07,  27.53},
+    {-5.65, -1.07,  27.53},
 }};
+
+// Per-LED outward normals. PSVRTracker's "cheezy" approximation:
+// take a head geometric centre 12 cm behind the visor centre
+// (roughly between the ears) and normalize (P_LED - head_centre).
+// Empirically validated by the upstream tracker. LED 0 sits at the
+// visor centre and yields (0, 0, -12) -> (0, 0, -1) after normalize,
+// i.e. "facing forward", which is the right outward direction for
+// the visor LED.
+static const std::array<cv::Vec3d, NUM_LEDS> kLEDNormals = []{
+    const cv::Vec3d head_centre(0.0, 0.0, 12.0);
+    std::array<cv::Vec3d, NUM_LEDS> n{};
+    for (size_t i = 0; i < NUM_LEDS; ++i) {
+        cv::Vec3d v(kLEDModel[i].x - head_centre[0],
+                    kLEDModel[i].y - head_centre[1],
+                    kLEDModel[i].z - head_centre[2]);
+        const double mag = std::sqrt(v.dot(v));
+        n[i] = (mag > 1e-6) ? cv::Vec3d(v[0]/mag, v[1]/mag, v[2]/mag)
+                            : cv::Vec3d(0, 0, -1);
+    }
+    return n;
+}();
 
 // Per-instance solver state; previously TU-globals (g_state_*, g_log_*)
 // which entangled hypothetical multi-tracker setups and made test
@@ -472,21 +500,23 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
         r.matched_blob_idx[i] = -1;
         if (P(2) <= 1.0) { visible[i] = false; r.visible[i] = false; continue; }
 
-        // Facing-camera check DISABLED. The previous heuristic
-        // (cdotp > r2, using P_head as a proxy for the LED's outward
-        // normal) only works for LED layouts whose head-frame origin
-        // is the geometric centre of the helmet sphere. Our model has
-        // its origin at LED 0 (visor centre), so P_head for front-of-
-        // visor LEDs has Phead.z > 0 ("back-of-head" direction in this
-        // convention), making the heuristic incorrectly classify
-        // forward-facing LEDs as occluded - dropping vis from the
-        // expected 5-7 to 1. The rear-strap-LEDs-are-confusing-the-
-        // matcher problem that originally motivated this filter is
-        // better handled inside permutation-RANSAC by inlier scoring;
-        // we'll re-introduce a correct per-LED outward-normal table
-        // (or a head-centre-corrected position vector) if rear-LED
-        // confusion shows up empirically again.
-        (void)C_head;
+        // Facing-camera check using PROPER per-LED outward normals
+        // (kLEDNormals). The previous heuristic (cdotp > r2) used
+        // P_head as a proxy for the normal, which only works for a
+        // sphere whose origin is the geometric centre - our model
+        // has its origin at the visor centre (LED 0), 12 cm in
+        // front of the head centre, so position vectors of front
+        // LEDs incorrectly pointed "back-of-head" and the heuristic
+        // dropped them. With per-LED normals derived from
+        // (point - head_centre), the test is correct for every LED
+        // (front, side, and rear strap).
+        const cv::Vec3d to_camera = C_head - cv::Vec3d(
+            kLEDModel[i].x, kLEDModel[i].y, kLEDModel[i].z);
+        if (kLEDNormals[i].dot(to_camera) <= 0.0) {
+            visible[i] = false;
+            r.visible[i] = false;
+            continue;
+        }
 
         const double u = K(0, 0) * P(0) / P(2) + K(0, 2);
         const double v = K(1, 1) * P(1) / P(2) + K(1, 2);
