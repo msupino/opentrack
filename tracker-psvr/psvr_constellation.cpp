@@ -456,20 +456,21 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
         r.matched_blob_idx[i] = -1;
         if (P(2) <= 1.0) { visible[i] = false; r.visible[i] = false; continue; }
 
-        // Facing-camera check. The 1.0 cm^2 floor handles the visor-
-        // center LED (|P_head| = 0) without a magic special-case
-        // branch: when r2 is tiny we just skip the gate and treat the
-        // LED as visible from any reasonable angle.
-        const cv::Vec3d Phead(kLEDModel[i].x, kLEDModel[i].y, kLEDModel[i].z);
-        const double r2 = Phead.dot(Phead);
-        if (r2 > 1.0) {
-            const double cdotp = C_head.dot(Phead);
-            if (cdotp <= r2) {
-                visible[i] = false;
-                r.visible[i] = false;
-                continue;
-            }
-        }
+        // Facing-camera check DISABLED. The previous heuristic
+        // (cdotp > r2, using P_head as a proxy for the LED's outward
+        // normal) only works for LED layouts whose head-frame origin
+        // is the geometric centre of the helmet sphere. Our model has
+        // its origin at LED 0 (visor centre), so P_head for front-of-
+        // visor LEDs has Phead.z > 0 ("back-of-head" direction in this
+        // convention), making the heuristic incorrectly classify
+        // forward-facing LEDs as occluded - dropping vis from the
+        // expected 5-7 to 1. The rear-strap-LEDs-are-confusing-the-
+        // matcher problem that originally motivated this filter is
+        // better handled inside permutation-RANSAC by inlier scoring;
+        // we'll re-introduce a correct per-LED outward-normal table
+        // (or a head-centre-corrected position vector) if rear-LED
+        // confusion shows up empirically again.
+        (void)C_head;
 
         const double u = K(0, 0) * P(0) / P(2) + K(0, 2);
         const double v = K(1, 1) * P(1) / P(2) + K(1, 2);

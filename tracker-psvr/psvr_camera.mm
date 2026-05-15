@@ -97,7 +97,10 @@ static constexpr int PSVR_CAM_LOG_INTERVAL_FRAMES = 30;
 // 20+ blobs/frame, starving the permutation-RANSAC budget. 7 px^2 is
 // the smallest disc that survives MORPH_OPEN(3x3) reliably, so any
 // real LED ~3 px or larger still passes.
-static constexpr double BLOB_MIN_AREA_PX = 7.0;
+// DIAGNOSTIC: dropped from 7.0 to 2.0 to admit small/distant LEDs while
+// we figure out why UGREEN's extractor finds 0-2 blobs. Tighten back
+// to ~5-7 once we know the helmet is reliably in the candidate set.
+static constexpr double BLOB_MIN_AREA_PX = 2.0;
 static constexpr double BLOB_MAX_AREA_PX = 500.0;
 
 // Minimum 4*PI*A/P^2 circularity. A geometric circle is 1.0; a real
@@ -107,7 +110,10 @@ static constexpr double BLOB_MAX_AREA_PX = 500.0;
 // and score 0.2-0.4. 0.55 keeps every real LED while dropping the
 // long-thin glints that ambient blue lighting paints onto desk
 // surfaces.
-static constexpr double BLOB_MIN_CIRCULARITY = 0.55;
+// DIAGNOSTIC: dropped from 0.55 to 0.30 to admit slightly elongated /
+// pixelated LED blobs (1-2 px diameter LEDs lose circularity to
+// rasterisation artefacts).
+static constexpr double BLOB_MIN_CIRCULARITY = 0.30;
 
 // Blob acceptance: a pixel is kept if EITHER
 //   (a) it's pure deep blue in HSV with high saturation and value:
@@ -132,11 +138,14 @@ static constexpr double BLOB_MIN_CIRCULARITY = 0.55;
 // teal. LED_S=180 floor means anything below ~70% saturation
 // is rejected: sky-blue UI elements, washed-out monitor pixels,
 // and pale-blue clothing all sit at S < 150 even when bright.
-static constexpr int LED_H_MIN     = 100;
-static constexpr int LED_H_MAX     = 125;
-static constexpr int LED_S_MIN     = 180;
-static constexpr int LED_V_MIN     = 200;
-static constexpr int WHITE_ABS_MIN = 235;
+// DIAGNOSTIC pass: dropped to "very wide" gates so we can confirm the
+// LEDs reach the extractor at all. If blobs= jumps to >>5 with these,
+// we know the gates were the limiter and tighten back from here.
+static constexpr int LED_H_MIN     = 90;     // was 100 (allow cyan-blue)
+static constexpr int LED_H_MAX     = 135;    // was 125 (allow violet-blue)
+static constexpr int LED_S_MIN     = 80;     // was 140 (admit desaturated AWB)
+static constexpr int LED_V_MIN     = 120;    // was 200 (admit dimmer)
+static constexpr int WHITE_ABS_MIN = 200;    // was 215 (admit less-saturated)
 
 static double now_sec() {
     return std::chrono::duration<double>(
@@ -770,16 +779,27 @@ static void process_frame(Worker::Impl* s, CVPixelBufferRef buf) {
     // already watching for USB HID activity.
     if (frames_after > 0 &&
         (frames_after % (uint64_t)PSVR_CAM_LOG_INTERVAL_FRAMES) == 0) {
+        // Reload the IMU rotation prior so the log line carries the
+        // orientation the matcher actually consumed for this frame.
+        // Converted to degrees for readability. yaw/pitch/roll are the
+        // values that drove the visibility filter; if vis=1-3 while the
+        // helmet is visibly facing the camera, those values are the
+        // first place to look.
+        constexpr double kRad2Deg = 180.0 / M_PI;
+        const double y_deg = s->yaw_rad.load(std::memory_order_relaxed)   * kRad2Deg;
+        const double p_deg = s->pitch_rad.load(std::memory_order_relaxed) * kRad2Deg;
+        const double r_deg = s->roll_rad.load(std::memory_order_relaxed)  * kRad2Deg;
         std::fprintf(stderr,
             "[psvr-cam] frames=%llu  any_blob=%llu  pnp_ok=%llu  "
             "last: blobs=%d vis=%d matched=%d pnp=%s reject=%s "
-            "pos=[%+.1f %+.1f %+.1f]\n",
+            "ypr=[%+.1f %+.1f %+.1f] pos=[%+.1f %+.1f %+.1f]\n",
             (unsigned long long)frames_after,
             (unsigned long long)blob_after,
             (unsigned long long)pnp_after,
             (int)blobs.size(), r.n_visible, r.n_matched,
             r.ok ? "OK" : "--",
             r.reject_reason,
+            y_deg, p_deg, r_deg,
             r.ok ? r.x_cm : 0.0,
             r.ok ? r.y_cm : 0.0,
             r.ok ? r.z_cm : 0.0);
