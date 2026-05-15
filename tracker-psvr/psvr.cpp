@@ -239,6 +239,18 @@ void PSVRTracker::install_calibration_banner()
                         "System Settings > Privacy & Security?\n"
                         "Fix the issue, then press Re-calibrate below.");
                     break;
+                case CALIB_FAIL_NOT_CONNECTED:
+                    msg = QObject::tr(
+                        "PSVR not detected on USB.\n"
+                        "• Check the cable from the helmet's processor "
+                        "unit to the Mac.\n"
+                        "• Make sure the processor unit is powered "
+                        "(its small LED is on).\n"
+                        "• Grant Input Monitoring permission to "
+                        "opentrack in System Settings > Privacy & "
+                        "Security.\n"
+                        "Fix the issue, then press Re-calibrate below.");
+                    break;
                 case CALIB_FAIL_NO_GRAVITY:
                     msg = QObject::tr(
                         "The PSVR headset appears to be OFF.\n"
@@ -1197,6 +1209,17 @@ void PSVRTracker::device_matched_cb(void* context, IOReturn, void*, IOHIDDeviceR
 
     self->send_activation(device);
 
+    // Hot-plug recovery: if a previous iteration of the watchdog
+    // declared CALIB_FAIL_NOT_CONNECTED because IOHIDManager hadn't
+    // matched anything yet, clearing the failure here lets the user
+    // recover by simply plugging in the cable - no Stop/Start cycle
+    // needed. Also re-arm the single-shot activation nudge so a
+    // subsequent silent stall (firmware mid-boot) can still benefit
+    // from it. Don't touch worker_start_time_: the watchdog will
+    // fall back to last_report_time_ as soon as samples flow.
+    self->calib_failure_.store(CALIB_FAIL_NONE, std::memory_order_release);
+    self->nudge_sent_ = false;
+
     IOHIDDeviceRegisterInputReportCallback(device, buf_ptr, 256,
                                            report_cb, context);
 }
@@ -1307,6 +1330,32 @@ void PSVRTracker::worker_loop()
                                    ? last_report_time_
                                    : worker_start_time_;
             const double elapsed = CFAbsoluteTimeGetCurrent() - ref;
+
+            // Fast-fail "not on USB" path. IOHIDManager's matching
+            // scan completes within a few ms of Open; if devices_ is
+            // still empty after NO_DEVICE_GRACE_SEC we know the
+            // headset isn't on the bus (cable unplugged, processor
+            // unit off, Input Monitoring permission refused). The
+            // 12 s nudge / 25 s timeout below were sized for the
+            // device-present-but-firmware-cold-booting case; making
+            // the user wait 25 s when there's no device at all is
+            // just bad UX. The matched-device callback resets
+            // calib_failure_ to NONE on hot-plug, so the user can
+            // recover by plugging the cable in.
+            bool no_devices;
+            {
+                std::lock_guard<std::mutex> lk(devices_mu_);
+                no_devices = devices_.empty();
+            }
+            if (no_devices && elapsed > NO_DEVICE_GRACE_SEC) {
+                qWarning() << "PSVR: no matching IOHIDDevice found after"
+                           << NO_DEVICE_GRACE_SEC
+                           << "s of Start - headset / processor unit not on"
+                              " USB, or Input Monitoring permission missing.";
+                calib_failure_.store(CALIB_FAIL_NOT_CONNECTED,
+                                     std::memory_order_release);
+                continue;
+            }
 
             // Nudge: at the halfway point to the hard timeout, if we
             // still haven't heard from the PSVR, re-fire the

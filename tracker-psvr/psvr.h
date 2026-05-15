@@ -184,6 +184,13 @@ private:
     // peaks at ~2 dps; deliberate hand motion is ≥5-10 dps, so the
     // separation is clean.
     static constexpr int CALIB_FAIL_MOVING     = 4;
+    // IOHIDManager's matching scan completed and no PSVR device
+    // arrived. Distinguished from CALIB_FAIL_NO_DATA so we can
+    // fast-fail (~2 s) instead of waiting the full NO_DATA_TIMEOUT
+    // window: a missing device on the USB bus is never going to
+    // start streaming, so the 25 s cold-boot grace is pure user
+    // annoyance for the unplugged / no-permission cases.
+    static constexpr int CALIB_FAIL_NOT_CONNECTED = 5;
     std::atomic<int> calib_failure_{CALIB_FAIL_NONE};
 
     // Peak |raw gyro| (dps, any axis) seen during the calibration
@@ -282,6 +289,12 @@ private:
     bool   nudge_sent_{false};
     static constexpr double NO_DATA_NUDGE_SEC    = 12.0;
     static constexpr double NO_DATA_TIMEOUT_SEC  = 25.0;
+    // How long to let IOHIDManager's initial matching scan complete
+    // before declaring "PSVR not on USB" when devices_ is still empty.
+    // Short enough that the user sees a useful banner within a couple
+    // of seconds; long enough that a slow cold-boot enumeration won't
+    // false-positive before the matched-device callback fires.
+    static constexpr double NO_DEVICE_GRACE_SEC  = 2.0;
 
     // Flipped true on the first HID report ever consumed. Used by
     // the UI poll timer to upgrade the "waiting for USB" banner to
