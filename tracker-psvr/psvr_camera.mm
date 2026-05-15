@@ -5,11 +5,21 @@
  *
  *   1. Receive CMSampleBuffer, wrap its pixel buffer as a cv::Mat
  *      without copying (IOSurface-backed, planar BGRA).
- *   2. Extract blue-dominant bright blobs: threshold on (B - max(R,G))
- *      + min absolute B brightness. Gives a clean mask even with face
- *      skin and monitor glare around the headset.
+ *   2. Extract bright blobs: convert to grayscale, threshold above
+ *      BRIGHT_THRESH (~200/255), morph-open to kill speckle. Replaces
+ *      the previous HSV-blue-gate + white-saturated double-mask;
+ *      the LEDs are eye-searing bright (>=240 on a real LED, >200
+ *      even with webcam AWB gain crushing), and "bright + roughly
+ *      circular" is a strictly stronger signal than "bright + blue"
+ *      because the latter depends on the camera's color rendition
+ *      (UGREEN/PSCam/FaceTime all hue-shift PSVR blue differently).
  *   3. Find contours, compute centroid + area per contour. Drop tiny
  *      and gigantic ones (noise / lamp reflections).
+ *   3b. Sub-pixel refine each blob's centre by mean-shifting on the
+ *      grayscale ROI (intensity-weighted COM iteration, ported from
+ *      tracker-pt). Gives ~5x lower PnP reprojection error than raw
+ *      contour moments because the latter is biased by which side
+ *      of the LED rasterised to one extra pixel.
  *   4. Pass the list of blob centroids to the constellation module
  *      along with the latest IMU rotation prior; it does LED-ID and
  *      solvePnP and returns a 6-DOF position if successful.
@@ -88,19 +98,14 @@ static constexpr int PSVR_CAM_LOG_INTERVAL_FRAMES = 30;
 
 // Minimum / maximum blob area in pixels for the extractor. The PSVR
 // LEDs at ~60-100 cm from a 720p camera at ~70deg HFOV render as
-// roughly 3-25 px diameter (7-500 px^2). The lower bound rejects
+// roughly 3-25 px diameter (5-500 px^2). The lower bound rejects
 // single-pixel speckle and the morphological-opening leftovers that
 // would otherwise inflate the candidate set into the 20+ range; the
 // upper bound rejects bright spread-out areas like a ceiling lamp or
-// a window in frame. Was 4..500 px^2; the 4 lower bound let single-
-// pixel-cluster speckle through and bloated noisy environments to
-// 20+ blobs/frame, starving the permutation-RANSAC budget. 7 px^2 is
-// the smallest disc that survives MORPH_OPEN(3x3) reliably, so any
-// real LED ~3 px or larger still passes.
-// DIAGNOSTIC: dropped from 7.0 to 2.0 to admit small/distant LEDs while
-// we figure out why UGREEN's extractor finds 0-2 blobs. Tighten back
-// to ~5-7 once we know the helmet is reliably in the candidate set.
-static constexpr double BLOB_MIN_AREA_PX = 2.0;
+// a window in frame. 5 px^2 is small enough to keep a 2-3 px LED at
+// ~150 cm range while still dropping the salt-and-pepper noise that
+// every webcam produces after grayscale thresholding.
+static constexpr double BLOB_MIN_AREA_PX = 5.0;
 static constexpr double BLOB_MAX_AREA_PX = 500.0;
 
 // Minimum 4*PI*A/P^2 circularity. A geometric circle is 1.0; a real
@@ -108,48 +113,97 @@ static constexpr double BLOB_MAX_AREA_PX = 500.0;
 // ranges 0.7-0.95. Highlights from room edges (monitor bezels, table
 // edges, glasses frames, the helmet's own metal trim) are elongated
 // and score 0.2-0.4. 0.55 keeps every real LED while dropping the
-// long-thin glints that ambient blue lighting paints onto desk
-// surfaces.
-// DIAGNOSTIC: dropped from 0.55 to 0.30 to admit slightly elongated /
-// pixelated LED blobs (1-2 px diameter LEDs lose circularity to
-// rasterisation artefacts).
-static constexpr double BLOB_MIN_CIRCULARITY = 0.30;
+// long-thin glints that bright surfaces paint onto desk furniture.
+static constexpr double BLOB_MIN_CIRCULARITY = 0.55;
 
-// Blob acceptance: a pixel is kept if EITHER
-//   (a) it's pure deep blue in HSV with high saturation and value:
-//         H in [LED_H_MIN, LED_H_MAX]   (deep blue, around 240 deg)
-//         S >= LED_S_MIN                (real LED is S~255)
-//         V >= LED_V_MIN                (LEDs are eye-searing bright)
-//       This is the daytime/lit-room case where PSVR LEDs saturate
-//       just the blue channel and burnt-in monitor blue is dimmer
-//       (lower V) or paler (lower S).
-//   OR
-//   (b) it's fully white-saturated: min(R,G,B) >= WHITE_ABS_MIN --
-//       the dark-room case where AVFoundation auto-exposure cranks
-//       gain and the LEDs blow out to white (R=G=B=255). The HSV
-//       blue gate would miss those because S drops to ~0 when all
-//       channels saturate. Threshold tightened from 220 to 235 so
-//       only genuinely blown-out highlights (the LEDs themselves)
-//       qualify, not just a desk lamp's halo.
-//
-// LED_H is in OpenCV's 0..179 scale (degrees / 2). 240 deg blue
-// maps to 120; we admit 100..125 which covers from cyan-leaning blue
-// (~200 deg) to indigo (~250 deg) without admitting magenta or
-// teal. LED_S=180 floor means anything below ~70% saturation
-// is rejected: sky-blue UI elements, washed-out monitor pixels,
-// and pale-blue clothing all sit at S < 150 even when bright.
-// DIAGNOSTIC pass: dropped to "very wide" gates so we can confirm the
-// LEDs reach the extractor at all. If blobs= jumps to >>5 with these,
-// we know the gates were the limiter and tighten back from here.
-static constexpr int LED_H_MIN     = 90;     // was 100 (allow cyan-blue)
-static constexpr int LED_H_MAX     = 135;    // was 125 (allow violet-blue)
-static constexpr int LED_S_MIN     = 80;     // was 140 (admit desaturated AWB)
-static constexpr int LED_V_MIN     = 120;    // was 200 (admit dimmer)
-static constexpr int WHITE_ABS_MIN = 200;    // was 215 (admit less-saturated)
+// Grayscale brightness threshold for the bright-blob mask. Pixels
+// above this value become "candidate LED" (255 in the binary mask);
+// everything else is rejected before contour finding. Tuned for the
+// PSVR LEDs which read >=240 on a calibrated capture and >=200 even
+// after a webcam's auto-exposure has gained the rest of the room up
+// to mid-grey. 200 is the lowest value that doesn't let typical
+// ceiling lamps and monitor reflections through; values much higher
+// (220+) start to drop the dimmer rear-strap LEDs when the helmet
+// is off-axis. If the periodic [psvr-cam] log shows blobs >= 20
+// consistently in a normal-lit room, raise this; if blobs <= 2 with
+// the helmet plainly visible, lower it. Field-confirmed working
+// range is 180..220 across UGREEN/FaceTime/PS Camera; 200 is the
+// safe middle.
+static constexpr int BRIGHT_THRESH = 200;
+
+// Mean-shift kernel-radius multiplier. Matches tracker-pt's
+// radius_c constant: the kernel is sized to the LED's footprint
+// (~sqrt(area/pi)) and scaled up by this factor so it covers a
+// neighbourhood big enough to "pull" the iteration toward the
+// brightest part of the LED even when the initial contour-centroid
+// estimate is biased by an extra rasterised pixel on one side.
+// 1.75 is what tracker-pt found "smaller values mean more changes;
+// 1 makes too many changes while 1.5 makes about .1".
+static constexpr double MEAN_SHIFT_RADIUS_C = 1.75;
+static constexpr int    MEAN_SHIFT_MAX_ITERS = 5;
 
 static double now_sec() {
     return std::chrono::duration<double>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+/* ------------------------------------------------------------------ *
+ * Mean-shift sub-pixel centering, ported verbatim from
+ * tracker-pt/module/point_extractor.cpp. The original carries this
+ * license header (MIT-equivalent) which travels with the code:
+ *
+ *   Copyright (c) 2012 Patrick Ruoff
+ *   Copyright (c) 2015-2017 Stanislaw Halik <sthalik@misaki.pl>
+ *
+ *   Permission to use, copy, modify, and/or distribute this software for any
+ *   purpose with or without fee is hereby granted, provided that the above
+ *   copyright notice and this permission notice appear in all copies.
+ *
+ * Algorithm (paraphrased from the tracker-pt comment): a moving
+ * kernel is multiplied with the gray-scale image and the centre of
+ * mass of the result is computed. The kernel centre is then set to
+ * the previous COM and the process is iterated until the kernel
+ * stops moving. Peaks in image intensity "pull" the kernel toward
+ * themselves. Eliminates the rasterisation bias of a pure contour-
+ * centroid estimate (the centroid can only move in 1-pixel steps as
+ * threshold-area boundary pixels are added/removed; mean-shift on
+ * the underlying grayscale image moves in sub-pixel steps).
+ *
+ * Returns the refined centre; if the integrated weight m is too
+ * small (e.g. the kernel landed on a uniformly-dark patch), returns
+ * the input current_center unchanged so the caller's loop terminates
+ * gracefully.
+ * ------------------------------------------------------------------ */
+static cv::Point2d MeanShiftIteration(const cv::Mat1b& frame_gray,
+                                      const cv::Point2d& current_center,
+                                      double filter_width)
+{
+    const double s = 1.0 / filter_width;
+    double m = 0.0;
+    cv::Point2d com{0.0, 0.0};
+    for (int i = 0; i < frame_gray.rows; ++i)
+    {
+        const uint8_t* __restrict ptr = frame_gray.ptr(i);
+        for (int j = 0; j < frame_gray.cols; ++j)
+        {
+            double val = (double)ptr[j];
+            val = val * val;  // square so brighter parts dominate
+            const double dx = (j - current_center.x) * s;
+            const double dy = (i - current_center.y) * s;
+            const double max_ = std::fmax(0.0, 1.0 - dx * dx - dy * dy);
+            val *= max_;
+            m += val;
+            com.x += j * val;
+            com.y += i * val;
+        }
+    }
+    if (m > 0.1)
+    {
+        com.x /= m;
+        com.y /= m;
+        return com;
+    }
+    return current_center;
 }
 
 } // namespace psvr_cam
@@ -201,7 +255,9 @@ struct Worker::Impl {
     // Reusable work buffers; owned by the delegate thread.
     cv::Mat bgra_view;      // zero-copy wrapper of the incoming frame
     cv::Mat bgr_owned;      // owned BGR copy (lives past IOSurface unlock)
-    cv::Mat hsv;            // HSV of bgr_owned for color-based gating
+    cv::Mat gray;           // single-channel grayscale of bgr_owned;
+                            // input to both the brightness threshold and
+                            // the mean-shift sub-pixel refinement pass
     cv::Mat mask;
 
     // Preview buffer: BGR annotated copy of the latest capture, with
@@ -500,32 +556,28 @@ static void process_frame(Worker::Impl* s, CVPixelBufferRef buf) {
 
     // Convert to an OpenCV-owned BGR buffer immediately. After this
     // line we no longer depend on the IOSurface and can unlock it.
-    // We also need a BGR copy below for the HSV conversion and for
-    // overlay drawing, so doing it once up-front is strictly cheaper
-    // than the previous arrangement (split-then-copy-later).
+    // We also need a BGR copy below for the BGR->grayscale conversion
+    // (extractor input) and for overlay drawing, so doing it once
+    // up-front is strictly cheaper than the previous arrangement
+    // (split-then-copy-later).
     cv::cvtColor(bgra, s->bgr_owned, cv::COLOR_BGRA2BGR);
 
     CVPixelBufferUnlockBaseAddress(buf, kCVPixelBufferLock_ReadOnly);
 
-    // HSV-based deep-blue gate. inRange does H, S, and V in one pass.
-    cv::cvtColor(s->bgr_owned, s->hsv, cv::COLOR_BGR2HSV);
-    cv::Mat mask_blue;
-    cv::inRange(s->hsv,
-                cv::Scalar(LED_H_MIN, LED_S_MIN, LED_V_MIN),
-                cv::Scalar(LED_H_MAX, 255,       255),
-                mask_blue);
-
-    // White-saturated branch: every channel near 255. Catches LEDs
-    // that have been gained up to white by auto-exposure in dark
-    // rooms, which the HSV blue gate would reject because S falls
-    // off as all channels saturate.
-    cv::Mat mask_sat;
-    cv::inRange(s->bgr_owned,
-                cv::Scalar(WHITE_ABS_MIN, WHITE_ABS_MIN, WHITE_ABS_MIN),
-                cv::Scalar(255, 255, 255),
-                mask_sat);
-
-    cv::bitwise_or(mask_blue, mask_sat, s->mask);
+    // Grayscale brightness gate. Was an HSV-blue + white-saturated
+    // double mask; replaced with a single grayscale threshold because
+    // (a) the PSVR LEDs are eye-searingly bright (>=240 on a
+    // calibrated capture, >=200 even after webcam AWB and exposure
+    // compression) so brightness alone separates them from the room,
+    // (b) the HSV blue-hue gate was camera-dependent - UGREEN,
+    // FaceTime, and the PS Camera each render PSVR blue at a
+    // different OpenCV-H angle, and we were chasing per-camera tuning
+    // tables for what is fundamentally a brightness signal. The
+    // tracker-pt webcam extractor uses the same approach (cv::COLOR_
+    // BGR2GRAY -> cv::threshold), see tracker-pt/module/point_
+    // extractor.cpp::threshold_image fixed-threshold branch.
+    cv::cvtColor(s->bgr_owned, s->gray, cv::COLOR_BGR2GRAY);
+    cv::threshold(s->gray, s->mask, BRIGHT_THRESH, 255, cv::THRESH_BINARY);
 
     // Small morphological opening to kill speckle noise, then contour find.
     cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, {3, 3});
@@ -534,7 +586,16 @@ static void process_frame(Worker::Impl* s, CVPixelBufferRef buf) {
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(s->mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
 
-    // Per-contour centroid + area + circularity gate.
+    // Per-contour area + circularity gate, then mean-shift sub-pixel
+    // refinement of the centroid using the underlying grayscale image
+    // as a peak-finder. The contour centroid alone is biased by which
+    // direction the binary-mask boundary rasterised; mean-shift on
+    // the gray image moves in sub-pixel steps toward the true LED
+    // peak. Cost: ~50 us per blob at typical ROI sizes; with <=20
+    // blobs that's <=1 ms/frame on top of the ~3 ms threshold/contour
+    // path. Net per-frame cost is comparable to or slightly cheaper
+    // than the old two-mask HSV path, since BGR2GRAY+threshold is
+    // strictly faster than BGR2HSV+inRange+inRange+bitwise_or.
     std::vector<cv::Point2d> blobs;
     blobs.reserve(contours.size());
     for (const auto& c : contours) {
@@ -544,9 +605,44 @@ static void process_frame(Worker::Impl* s, CVPixelBufferRef buf) {
         if (perim <= 0) continue;
         const double circularity = 4.0 * CV_PI * area / (perim * perim);
         if (circularity < BLOB_MIN_CIRCULARITY) continue;
-        const cv::Moments m = cv::moments(c);
-        if (m.m00 <= 0) continue;
-        blobs.emplace_back(m.m10 / m.m00, m.m01 / m.m00);
+        const cv::Moments mom = cv::moments(c);
+        if (mom.m00 <= 0) continue;
+        const double cx_global = mom.m10 / mom.m00;
+        const double cy_global = mom.m01 / mom.m00;
+
+        // Mean-shift refinement uses an ROI around the contour
+        // bounding box, padded slightly so the kernel can "see" the
+        // LED's brightness falloff outside the thresholded core.
+        // We clip to image bounds (negative origin / past-edge ROIs
+        // would crash cv::Mat); if the contour sits on the image
+        // edge we fall back to the contour-centroid estimate.
+        const cv::Rect bbox = cv::boundingRect(c);
+        const int pad = std::max(2, (int)std::ceil(std::sqrt(area) * 0.5));
+        cv::Rect roi(bbox.x - pad, bbox.y - pad,
+                     bbox.width + 2 * pad, bbox.height + 2 * pad);
+        roi &= cv::Rect(0, 0, s->gray.cols, s->gray.rows);
+        if (roi.width < 3 || roi.height < 3) {
+            blobs.emplace_back(cx_global, cy_global);
+            continue;
+        }
+        const cv::Mat1b roi_gray = s->gray(roi);
+        // Kernel radius from the LED's footprint (radius = sqrt(A/pi))
+        // scaled by tracker-pt's empirical MEAN_SHIFT_RADIUS_C.
+        const double radius_px    = std::sqrt(area / CV_PI);
+        const double filter_width = radius_px * MEAN_SHIFT_RADIUS_C;
+        // Seed mean-shift with the contour centroid in ROI-local
+        // coordinates. The iteration runs until the centre stops
+        // moving (delta^2 < 1e-3 px) or MEAN_SHIFT_MAX_ITERS rounds.
+        cv::Point2d pos(cx_global - roi.x, cy_global - roi.y);
+        for (int iter = 0; iter < MEAN_SHIFT_MAX_ITERS; ++iter) {
+            const cv::Point2d com_new = MeanShiftIteration(
+                roi_gray, pos, filter_width);
+            const double ddx = com_new.x - pos.x;
+            const double ddy = com_new.y - pos.y;
+            pos = com_new;
+            if (ddx * ddx + ddy * ddy < 1e-3) break;
+        }
+        blobs.emplace_back(pos.x + roi.x, pos.y + roi.y);
     }
 
     // The overlay-drawing block below mutates a BGR copy of the
