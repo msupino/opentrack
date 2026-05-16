@@ -806,14 +806,43 @@ static void process_frame(Worker::Impl* s, CVPixelBufferRef buf) {
         s->pos_seq.fetch_add(1, std::memory_order_acq_rel);
     }
 
+    // Diag bookkeeping (protected by a lightweight mutex only during
+    // bulk copy; fine even at 60 Hz). Snapshot the cumulative counters
+    // here so the preview overlay below + the periodic stderr summary
+    // both read the same just-updated values. Moved above the preview
+    // block so the overlay can show "pnp_ok: N / M" correctly without
+    // a one-frame lag.
+    uint64_t frames_after = 0, blob_after = 0, pnp_after = 0;
+    {
+        std::lock_guard<std::mutex> lk(s->diag_mu);
+        s->diag.frames_captured++;
+        if (!blobs.empty()) s->diag.frames_with_any_blob++;
+        if (r.ok)           s->diag.pnp_ok_count++;
+        s->diag.last_n_blobs        = (int)blobs.size();
+        s->diag.last_n_visible      = r.n_visible;
+        s->diag.last_n_matched      = r.n_matched;
+        s->diag.last_bright_thresh  = bright_thresh;
+        s->diag.last_pnp_ok         = r.ok;
+        s->diag.last_reject_reason  = r.reject_reason;
+        if (r.ok) {
+            s->diag.last_x_cm = r.x_cm;
+            s->diag.last_y_cm = r.y_cm;
+            s->diag.last_z_cm = r.z_cm;
+        }
+        frames_after = s->diag.frames_captured;
+        blob_after   = s->diag.frames_with_any_blob;
+        pnp_after    = s->diag.pnp_ok_count;
+    }
+
     // Build the annotated preview frame. `vis` was already populated
     // (BGR copy of the capture) above, before we unlocked the IOSurface
     // - we mutate it here with overlays for the Qt preview dialog:
     // blobs as red filled dots, projected LEDs as hollow green circles,
-    // matched pairs as yellow lines, plus a status banner. This doubles
-    // as a visual debugger for coordinate-frame conventions: if projected
-    // LEDs land in the wrong corner of the frame relative to the actual
-    // blobs, the bug is obvious.
+    // matched pairs as yellow lines, plus a multi-line diagnostic
+    // stack at top-left. This doubles as a visual debugger for
+    // coordinate-frame conventions: if projected LEDs land in the
+    // wrong corner of the frame relative to the actual blobs, the bug
+    // is obvious.
     {
         // Detected blobs: small red filled circles.
         for (const auto& b : blobs) {
@@ -848,26 +877,49 @@ static void process_frame(Worker::Impl* s, CVPixelBufferRef buf) {
                      cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
         }
 
-        // Solver-state banner at the top-left: blob/match/PnP numbers
-        // live. Sized so it stays readable after the preview QLabel
-        // scales the 1280x720 capture down to ~640x360 in the
-        // tracker-frame (half-size), which halves apparent font
-        // height. Drawn black-then-white for legibility on any bg.
-        char solver_status[256];
-        std::snprintf(solver_status, sizeof solver_status,
-                      "blobs=%d  matched=%d  pnp=%s  rms=%.1f  pos=[%+.1f %+.1f %+.1f]",
-                      (int)blobs.size(), r.n_matched,
-                      r.ok ? "OK" : "--",
-                      r.reprojection_rms,
-                      r.ok ? r.x_cm : 0.0,
-                      r.ok ? r.y_cm : 0.0,
-                      r.ok ? r.z_cm : 0.0);
-        cv::putText(vis, solver_status, cv::Point(16, 36),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.9,
-                    cv::Scalar(0, 0, 0), 5, cv::LINE_AA);
-        cv::putText(vis, solver_status, cv::Point(16, 36),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.9,
-                    cv::Scalar(255, 255, 255), 2, cv::LINE_AA);
+        // Multi-line diagnostic stack at top-left. Shows the same
+        // values the periodic [psvr-cam] stderr line carries, so a
+        // user diagnosing the helmet pose from inside opentrack's
+        // UI (i.e. without a terminal in view) sees the same signal
+        // the developer sees. Compact 0.5 scale + 22 px line height
+        // fits ~24 chars per line; the preview QLabel halves the
+        // 1280x720 capture to ~640x360, so apparent text height is
+        // ~11 px - readable but unobtrusive.
+        constexpr double kRad2Deg = 180.0 / M_PI;
+        const double y_deg = s->yaw_rad.load(std::memory_order_relaxed)   * kRad2Deg;
+        const double p_deg = s->pitch_rad.load(std::memory_order_relaxed) * kRad2Deg;
+        const double rr_deg= s->roll_rad.load(std::memory_order_relaxed)  * kRad2Deg;
+        char lines[4][96];
+        std::snprintf(lines[0], sizeof lines[0],
+                      "blobs: %d   vis: %d   matched: %d",
+                      (int)blobs.size(), r.n_visible, r.n_matched);
+        std::snprintf(lines[1], sizeof lines[1],
+                      "thresh: %d   reject: %s",
+                      bright_thresh, r.reject_reason);
+        std::snprintf(lines[2], sizeof lines[2],
+                      "ypr: %+.0f %+.0f %+.0f   pos: %+.1f %+.1f %+.1f",
+                      y_deg, p_deg, rr_deg,
+                      r.ok ? r.x_cm : s->diag.last_x_cm,
+                      r.ok ? r.y_cm : s->diag.last_y_cm,
+                      r.ok ? r.z_cm : s->diag.last_z_cm);
+        std::snprintf(lines[3], sizeof lines[3],
+                      "pnp_ok: %llu / %llu  rms: %.1f",
+                      (unsigned long long)pnp_after,
+                      (unsigned long long)frames_after,
+                      r.reprojection_rms);
+        const int line_h = 22;
+        int y = 24;
+        for (const auto& ln : lines) {
+            // Black drop-shadow then white text - readable on any bg
+            // including a fully bright frame.
+            cv::putText(vis, ln, cv::Point(12, y),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.5,
+                        cv::Scalar(0, 0, 0), 3, cv::LINE_AA);
+            cv::putText(vis, ln, cv::Point(12, y),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.5,
+                        cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
+            y += line_h;
+        }
 
         // Multi-line status banner from the plugin (calibration state,
         // failure messages, etc.). Drawn larger and centered so it's
@@ -957,32 +1009,6 @@ static void process_frame(Worker::Impl* s, CVPixelBufferRef buf) {
 
         std::lock_guard<std::mutex> lk(s->preview_mu);
         s->preview_bgr = std::move(vis);
-    }
-
-    // Diag bookkeeping (protected by a lightweight mutex only during
-    // bulk copy; fine even at 60 Hz). Snapshot the cumulative counters
-    // here so the periodic stderr summary below can read them without
-    // re-acquiring the mutex.
-    uint64_t frames_after = 0, blob_after = 0, pnp_after = 0;
-    {
-        std::lock_guard<std::mutex> lk(s->diag_mu);
-        s->diag.frames_captured++;
-        if (!blobs.empty()) s->diag.frames_with_any_blob++;
-        if (r.ok)           s->diag.pnp_ok_count++;
-        s->diag.last_n_blobs        = (int)blobs.size();
-        s->diag.last_n_visible      = r.n_visible;
-        s->diag.last_n_matched      = r.n_matched;
-        s->diag.last_bright_thresh  = bright_thresh;
-        s->diag.last_pnp_ok         = r.ok;
-        s->diag.last_reject_reason  = r.reject_reason;
-        if (r.ok) {
-            s->diag.last_x_cm = r.x_cm;
-            s->diag.last_y_cm = r.y_cm;
-            s->diag.last_z_cm = r.z_cm;
-        }
-        frames_after = s->diag.frames_captured;
-        blob_after   = s->diag.frames_with_any_blob;
-        pnp_after    = s->diag.pnp_ok_count;
     }
 
     // Periodic [psvr-cam] stderr summary. One line per
