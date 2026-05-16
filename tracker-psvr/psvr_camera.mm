@@ -72,6 +72,7 @@
 #include <mutex>
 #include <chrono>
 #include <cstdio>
+#include <limits>
 
 namespace psvr_cam {
 
@@ -659,6 +660,46 @@ static void process_frame(Worker::Impl* s, CVPixelBufferRef buf) {
 
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(s->mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+    // Diagnostic: raw contour statistics, once per ~30 frames. Tells
+    // us at a glance whether the extractor is producing many small
+    // contours that the area/circularity gate is filtering down, or
+    // one giant contour (room window, monitor reflection, ceiling
+    // lamp) that BLOB_MAX_AREA_PX rejects and leaves us with
+    // nothing.
+    //
+    // Symptom-side correspondence: the periodic [psvr-cam] line
+    // showing blobs=1-3 with thresh=237 is consistent with both
+    // (a) "thousands of bright pixels merged into one giant blob
+    // larger than BLOB_MAX_AREA_PX" and (b) "thousands of pixels in
+    // many tiny clusters all under BLOB_MIN_AREA_PX". This log
+    // distinguishes them: case (a) shows raw_n small and max_area
+    // huge with a large bbox; case (b) shows raw_n big and max_area
+    // tiny. The fix is different - case (a) needs a watershed split
+    // or BLOB_MAX_AREA_PX raise, case (b) needs morph_open tuning
+    // or a lower BLOB_MIN_AREA_PX.
+    {
+        static int diag_skip = 0;
+        if (++diag_skip >= 30) {
+            diag_skip = 0;
+            int    raw_n   = (int)contours.size();
+            double min_a   = raw_n ? std::numeric_limits<double>::infinity() : 0.0;
+            double max_a   = 0.0;
+            cv::Rect big_bbox{0, 0, 0, 0};
+            for (const auto& c : contours) {
+                const double a = cv::contourArea(c);
+                if (a < min_a) min_a = a;
+                if (a > max_a) { max_a = a; big_bbox = cv::boundingRect(c); }
+            }
+            // Print 0 for min_a when there are no contours, not +inf.
+            if (raw_n == 0) min_a = 0.0;
+            std::fprintf(stderr,
+                "[psvr-cam] contour stats: raw=%d min_area=%.0f max_area=%.0f "
+                "largest_bbox=(%d,%d,%dx%d)\n",
+                raw_n, min_a, max_a,
+                big_bbox.x, big_bbox.y, big_bbox.width, big_bbox.height);
+        }
+    }
 
     // Per-contour area + circularity gate, then mean-shift sub-pixel
     // refinement of the centroid using the underlying grayscale image
