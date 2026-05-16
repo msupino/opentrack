@@ -58,6 +58,7 @@ struct Diag {
     int      last_n_blobs{0};
     int      last_n_visible{0};   // LEDs that passed facing-camera filter
     int      last_n_matched{0};
+    int      last_bright_thresh{0};  // adaptive grayscale threshold used
     bool     last_pnp_ok{false};
     // Short tag for the latest solver outcome - "OK", "TOO_FEW_BLOBS",
     // "TOO_FEW_VISIBLE", "NO_AP3P_FIT", "RANSAC_FEW_INLIERS",

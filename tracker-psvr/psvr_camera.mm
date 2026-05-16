@@ -105,31 +105,67 @@ static constexpr int PSVR_CAM_LOG_INTERVAL_FRAMES = 30;
 // a window in frame. 5 px^2 is small enough to keep a 2-3 px LED at
 // ~150 cm range while still dropping the salt-and-pepper noise that
 // every webcam produces after grayscale thresholding.
-static constexpr double BLOB_MIN_AREA_PX = 5.0;
+// DIAGNOSTIC v2: dropped all the way to 1.0 to admit even single-pixel
+// LED dots. With area=1 plus circularity disabled below, virtually any
+// bright pixel cluster passes. Matcher's RANSAC + facing-camera filter
+// will discriminate real LEDs from noise. Tighten back toward 3-5
+// once we know blobs are reaching the matcher.
+static constexpr double BLOB_MIN_AREA_PX = 1.0;
 static constexpr double BLOB_MAX_AREA_PX = 500.0;
 
 // Minimum 4*PI*A/P^2 circularity. A geometric circle is 1.0; a real
 // PSVR LED (with a tiny bit of motion blur / partial saturation tail)
 // ranges 0.7-0.95. Highlights from room edges (monitor bezels, table
 // edges, glasses frames, the helmet's own metal trim) are elongated
-// and score 0.2-0.4. 0.55 keeps every real LED while dropping the
-// long-thin glints that bright surfaces paint onto desk furniture.
-static constexpr double BLOB_MIN_CIRCULARITY = 0.55;
+// and score 0.2-0.4. 0.55 was the original tight value; DIAGNOSTIC v2
+// disables the gate (0.0) so reflections off helmet plastic, partial
+// rim LEDs at off-axis poses, and pixelated dots all pass. The
+// matcher's RANSAC + facing-camera filter discriminate real LEDs.
+static constexpr double BLOB_MIN_CIRCULARITY = 0.0;
 
-// Grayscale brightness threshold for the bright-blob mask. Pixels
-// above this value become "candidate LED" (255 in the binary mask);
-// everything else is rejected before contour finding. Tuned for the
-// PSVR LEDs which read >=240 on a calibrated capture and >=200 even
-// after a webcam's auto-exposure has gained the rest of the room up
-// to mid-grey. 200 is the lowest value that doesn't let typical
-// ceiling lamps and monitor reflections through; values much higher
-// (220+) start to drop the dimmer rear-strap LEDs when the helmet
-// is off-axis. If the periodic [psvr-cam] log shows blobs >= 20
-// consistently in a normal-lit room, raise this; if blobs <= 2 with
-// the helmet plainly visible, lower it. Field-confirmed working
-// range is 180..220 across UGREEN/FaceTime/PS Camera; 200 is the
-// safe middle.
-static constexpr int BRIGHT_THRESH = 200;
+// Grayscale brightness threshold for the bright-blob mask is now
+// chosen ADAPTIVELY per frame from the gray histogram (see
+// adaptive_bright_threshold below). The principle: PSVR LEDs are
+// reliably the brightest things in a normally-lit room, so we walk
+// down from V=255 until we've captured enough bright pixels for
+// ~9 LED blobs (N_TARGET_BRIGHT_PIXELS), then threshold there.
+// Adapts to dim rooms (LEDs at V~210), bright rooms (V~250), or
+// any auto-exposure shift between frames. The chosen value is
+// surfaced in the [psvr-cam] periodic log as `thresh=NNN`.
+//
+// FLOOR/CEIL clamp the search range so:
+//   - Hyper-bright scenes (sun on the wall, max=255 over half the
+//     frame) don't pin the threshold to 255 and lose the LEDs.
+//   - Hyper-dim scenes (no LEDs visible at all) don't drive the
+//     threshold down into ordinary mid-grey territory.
+// N_TARGET = 1500 matches roughly 9 LEDs * pi * (7px)^2 = 1385 px,
+// rounded up for blur halos.
+static constexpr int BRIGHT_THRESH_FLOOR = 180;
+static constexpr int BRIGHT_THRESH_CEIL  = 250;
+static constexpr int N_TARGET_BRIGHT_PIXELS = 1500;
+
+// Pick a brightness threshold by walking the histogram from V=255
+// down until cumulative pixel count reaches N_TARGET_BRIGHT_PIXELS.
+// Result is clamped to [FLOOR, CEIL]. O(W*H) for the histogram +
+// O(256) for the walk; ~0.5 ms total at 1280x720. No state -
+// next-frame's threshold is independent of this frame's, so a
+// momentary occlusion can't pin a bad value across frames.
+static int adaptive_bright_threshold(const cv::Mat& gray) {
+    int hist_size = 256;
+    float range[] = {0.f, 256.f};
+    const float* hist_range = range;
+    cv::Mat hist;
+    cv::calcHist(&gray, 1, nullptr, cv::Mat(), hist, 1,
+                 &hist_size, &hist_range);
+    int cum = 0;
+    for (int v = 255; v >= 0; --v) {
+        cum += static_cast<int>(hist.at<float>(v));
+        if (cum >= N_TARGET_BRIGHT_PIXELS)
+            return std::max(BRIGHT_THRESH_FLOOR,
+                            std::min(BRIGHT_THRESH_CEIL, v));
+    }
+    return BRIGHT_THRESH_FLOOR;
+}
 
 // Mean-shift kernel-radius multiplier. Matches tracker-pt's
 // radius_c constant: the kernel is sized to the LED's footprint
@@ -594,11 +630,32 @@ static void process_frame(Worker::Impl* s, CVPixelBufferRef buf) {
     // BGR2GRAY -> cv::threshold), see tracker-pt/module/point_
     // extractor.cpp::threshold_image fixed-threshold branch.
     cv::cvtColor(s->bgr_owned, s->gray, cv::COLOR_BGR2GRAY);
-    cv::threshold(s->gray, s->mask, BRIGHT_THRESH, 255, cv::THRESH_BINARY);
+    const int bright_thresh = adaptive_bright_threshold(s->gray);
+    cv::threshold(s->gray, s->mask, bright_thresh, 255, cv::THRESH_BINARY);
 
-    // Small morphological opening to kill speckle noise, then contour find.
-    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, {3, 3});
+    // DIAGNOSTIC: morph_open dropped to 2x2 from 3x3 and area gate
+    // dropped (see BLOB_MIN_AREA_PX) to admit small LED projections.
+    // Reverts to {3,3} once we know the LEDs are reaching the
+    // extractor as bright pixels.
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, {2, 2});
     cv::morphologyEx(s->mask, s->mask, cv::MORPH_OPEN, kernel);
+
+    // Diagnostic: report the actual brightness range the camera is
+    // delivering, ONCE per second (~30 frames). Reveals AVFoundation
+    // exposure issues - if max never gets above ~220 even with the
+    // LEDs in view, the camera is suppressing them and a software-
+    // side threshold tweak can't fix it.
+    {
+        static int diag_skip = 0;
+        if (++diag_skip >= 30) {
+            diag_skip = 0;
+            double mn = 0, mx = 0;
+            cv::minMaxLoc(s->gray, &mn, &mx);
+            std::fprintf(stderr,
+                "[psvr-cam] frame brightness: min=%.0f max=%.0f thresh=%d\n",
+                mn, mx, bright_thresh);
+        }
+    }
 
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(s->mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
@@ -874,6 +931,7 @@ static void process_frame(Worker::Impl* s, CVPixelBufferRef buf) {
         s->diag.last_n_blobs        = (int)blobs.size();
         s->diag.last_n_visible      = r.n_visible;
         s->diag.last_n_matched      = r.n_matched;
+        s->diag.last_bright_thresh  = bright_thresh;
         s->diag.last_pnp_ok         = r.ok;
         s->diag.last_reject_reason  = r.reject_reason;
         if (r.ok) {
@@ -905,11 +963,12 @@ static void process_frame(Worker::Impl* s, CVPixelBufferRef buf) {
         const double r_deg = s->roll_rad.load(std::memory_order_relaxed)  * kRad2Deg;
         std::fprintf(stderr,
             "[psvr-cam] frames=%llu  any_blob=%llu  pnp_ok=%llu  "
-            "last: blobs=%d vis=%d matched=%d pnp=%s reject=%s "
+            "last: thresh=%d blobs=%d vis=%d matched=%d pnp=%s reject=%s "
             "ypr=[%+.1f %+.1f %+.1f] pos=[%+.1f %+.1f %+.1f]\n",
             (unsigned long long)frames_after,
             (unsigned long long)blob_after,
             (unsigned long long)pnp_after,
+            bright_thresh,
             (int)blobs.size(), r.n_visible, r.n_matched,
             r.ok ? "OK" : "--",
             r.reject_reason,
