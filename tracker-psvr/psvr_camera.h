@@ -62,8 +62,9 @@ struct Diag {
     bool     last_pnp_ok{false};
     // Short tag for the latest solver outcome - "OK", "TOO_FEW_BLOBS",
     // "TOO_FEW_VISIBLE", "NO_AP3P_FIT", "RANSAC_FEW_INLIERS",
-    // "HIGH_RMS", "Z_OUT_OF_RANGE", "JUMP". Empty until the first
-    // frame solves. std::string (not const char*) so the snapshot
+    // "HIGH_RMS", "Z_OUT_OF_RANGE", "JUMP", "WEAK_FIRST_LOCK". Empty
+    // until the first frame solves. std::string (not const char*) so
+    // the snapshot
     // copy is self-contained: a caller can hold the Diag value past
     // any solver state changes without dangling pointer concerns.
     std::string last_reject_reason;

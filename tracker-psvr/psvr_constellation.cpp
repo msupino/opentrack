@@ -198,26 +198,49 @@ constexpr double kRansacInlierThreshPx  = 25.0; // per-point error for RANSAC
 constexpr int    kRansacIterations      = 200;  // usually converges in <50
 // Inlier gate for the upstream permutation-search step: a candidate
 // pose is scored by counting how many of the 9 LEDs project within
-// this many pixels of any blob. Set wider than kRansacInlierThreshPx
-// so the search is permissive (we want to identify the right
-// LED-to-blob assignment, then let downstream RANSAC tighten the fit).
-constexpr double kPermSearchInlierPx    = 30.0;
-// Jump gate: at 30 Hz, a real head can move at most ~1 m/s
-// comfortably, which is ~3 cm per frame. We set the gate at 6 cm
-// (~1.8 m/s - fast head motion) to reject the common failure mode
-// where the permutation matcher oscillates between two geometrically
-// consistent LED-to-blob assignments that differ by 10-20 cm in 3D.
-// Both interpretations have equally-low reprojection RMS so RANSAC
-// can't break the tie; the jump gate does it by locking in whichever
-// interpretation won the first frame. A briefly-stale prior (>1 s)
-// resets this lock so a real re-enter-frame-from-elsewhere scenario
-// isn't permanently rejected.
-constexpr double kMaxCmPerFrame         = 6.0;
-constexpr int    kMinInliers            = 4;    // solvePnPRansac minimum
+// this many pixels of any blob. Was 30 px; tightened to 15 px after
+// repeated observation that 30 was permissive enough for a 3-blob
+// "spurious cluster of room lights" to score 3 inliers on a wholly
+// fictitious pose, win the search, and lock the matcher onto
+// nonsense geometry. At 15 px (about 1 LED footprint at our typical
+// range) the matcher demands actual spatial coincidence between the
+// reprojected LED and a real blob.
+constexpr double kPermSearchInlierPx    = 15.0;
+// Jump gate: at 30 Hz a real head moves at most ~1 m/s comfortably,
+// which is ~3 cm per frame. Was 6 cm (~1.8 m/s = jogging-on-a-
+// stationary-head levels); tightened to 3 cm. False-lock failure
+// mode the original loose gate failed to catch: the matcher
+// oscillates frame-to-frame between two near-symmetric LED-to-blob
+// assignments whose 3D solutions are 4-5 cm apart, both with
+// reasonable reprojection RMS, and the jumps look like real head
+// motion. At 3 cm/frame the oscillation is unambiguously rejected
+// and the lock stabilises on whichever assignment is geometrically
+// correct.
+constexpr double kMaxCmPerFrame         = 3.0;
+// Minimum inliers for an already-locked track to continue. PSVR has
+// 9 LEDs; 4 is the AP3P minimum + 1 disambiguator. Used when we
+// have a fresh prior (i.e. continuing an existing lock); the
+// downstream jump gate provides the additional consistency check.
+constexpr int    kMinInliers            = 4;
+// Stricter inlier count required for the FIRST-publish lock when
+// there's no fresh prior (cold start, or >1 s since last accepted
+// frame). The jump gate can't catch a false first-lock - there's
+// nothing to jump from - so the only defense is to demand the
+// matcher identify a substantial majority of the 9 LEDs before
+// publishing any position. 6 / 9 = 67% is the lowest count that
+// rules out the common "3-blob coincidence" failure mode where a
+// trio of room lights happens to fit a wrong pose.
+constexpr int    kStrongLockMinInliers  = 6;
 constexpr double kStalenessResetSec     = 1.0;  // prior expires after
 constexpr double kDefaultUserZCm        = 60.0; // cold-start Z guess
-constexpr double kMinAcceptableZCm      = 20.0; // sanity floor
-constexpr double kMaxAcceptableZCm      = 200.0;// sanity ceiling
+// Z sanity bounds. Was [20, 200] cm. Tightened to [30, 120]: a
+// head closer than 30 cm to a desktop webcam is physically jammed
+// against the screen; farther than 120 cm is across the room from
+// any plausible desk/sim-pit setup. The 178 cm false-locks seen in
+// the field landed inside the old [20, 200] window and weren't
+// rejected; the new ceiling cuts them.
+constexpr double kMinAcceptableZCm      = 30.0;
+constexpr double kMaxAcceptableZCm      = 120.0;
 
 // Lazy-open the per-instance debug log on first solve() call.
 //
@@ -848,6 +871,27 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
                       r.n_matched, true, rms, tvec, "REJECT_JUMP");
             return r;
         }
+    }
+
+    // Strong-lock-on-first-publish gate. When we DON'T have a fresh
+    // prior, the jump gate above couldn't run; the only remaining
+    // defense against latching a one-off false geometric fit is to
+    // demand a higher inlier count before publishing the very first
+    // position. Once the lock is established (have_prior becomes
+    // true on the next frame), the standard kMinInliers floor
+    // applies and the jump gate takes over consistency duty.
+    //
+    // Without this gate, the matcher would occasionally publish a
+    // single-frame nonsense position (the observed (20, 63, 178) cm
+    // false-lock landed here) and the consuming pose pipeline
+    // smoothed it through to opentrack's output, producing the
+    // visible "green dots flash, X/Y/Z jumps" symptom.
+    if (!jump_ref_valid && (int)inliers.rows < kStrongLockMinInliers) {
+        r.reject_reason = "WEAK_FIRST_LOCK";
+        log_frame(dbg, yaw_rad, pitch_rad, roll_rad, prior_tvec,
+                  blobs, projected, visible,
+                  r.n_matched, true, rms, tvec, "REJECT_WEAK_FIRST_LOCK");
+        return r;
     }
 
     // Accept. Cache as prior for the next frame and pass tvec through
