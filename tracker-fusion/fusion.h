@@ -24,7 +24,6 @@ class fusion_tracker : public QObject, public ITracker
 
     double rot_tracker_data[6] {}, pos_tracker_data[6] {};
 
-    std::unique_ptr<QFrame> other_frame { std::make_unique<QFrame>() };
     std::shared_ptr<dylib> rot_dylib, pos_dylib;
     std::shared_ptr<ITracker> rot_tracker, pos_tracker;
 
