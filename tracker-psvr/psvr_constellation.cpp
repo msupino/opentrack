@@ -163,6 +163,13 @@ struct SolverState::Impl {
     std::mutex log_mu;
     FILE*      log_fp           = nullptr;
     bool       log_attempted    = false;
+
+    // Diagnostic counter: solve() increments unconditionally so the
+    // per-LED facing-camera dot-product log line can be gated to
+    // ~every 60 frames (about 2 s at 30 fps). Lives in Impl rather
+    // than as a function-local static so concurrent SolverStates
+    // (hypothetical multi-tracker setup) keep separate counts.
+    uint64_t   diag_frame_count = 0;
 };
 
 namespace {
@@ -363,17 +370,7 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
     Result r;
     r.n_blobs_total = (int)blobs.size();
     FILE* dbg = debug_log_fp(s);
-    if ((int)blobs.size() < kMinInliers) {
-        r.reject_reason = "TOO_FEW_BLOBS";
-        if (dbg) {
-            std::array<cv::Point2d, NUM_LEDS> empty_proj{};
-            std::array<bool, NUM_LEDS>        empty_vis{};
-            log_frame(dbg, yaw_rad, pitch_rad, roll_rad, cv::Vec3d(0, 0, 0),
-                      blobs, empty_proj, empty_vis,
-                      0, false, 0, cv::Vec3d(0, 0, 0), "REJECT_TOO_FEW_BLOBS");
-        }
-        return r;
-    }
+    const uint64_t this_frame = s.diag_frame_count++;
 
     // Snapshot prior state under the mutex, then release before the
     // OpenCV work. The state is only a handful of doubles so the copy
@@ -395,6 +392,12 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
     // told the visibility filter "head faces dead-ahead at the
     // camera" and admitted only the front-facing 5 LEDs no matter
     // which way the user was actually looking.
+    //
+    // NOTE: hoisted above the kMinInliers early-return so the per-LED
+    // facing-camera dot-product diagnostic below has a prior_tvec to
+    // work with even on frames where the extractor delivered too few
+    // blobs to run PnP. That gating fail is exactly when we most want
+    // visibility into "would the matcher have seen anything anyway?".
     cv::Vec3d prior_tvec;
     bool      have_prior;
     {
@@ -403,6 +406,58 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
                            (steady_now_sec() - s.state_epoch_sec) < kStalenessResetSec;
         have_prior = fresh;
         prior_tvec = have_prior ? s.state_tvec : cv::Vec3d(0, 0, kDefaultUserZCm);
+    }
+
+    // Per-LED facing-camera dot-product diagnostic, every 60 solves
+    // (~2 s at 30 fps). Computes the same quantity the visibility
+    // filter further down rejects on: dot(normal_i, C_head - P_i).
+    // Positive means the LED faces the camera at the current pose
+    // prior; negative means it points away (helmet self-occluded).
+    //
+    // Behavior unchanged - this only prints. Runs BEFORE the
+    // blobs<kMinInliers early-return because that's the symptom we
+    // want to debug: when vis=0 is being reported in the periodic
+    // [psvr-cam] log, this line tells us whether vis=0 is "all LEDs
+    // legitimately self-occluded by the current IMU pose" or "we
+    // bailed out before reaching the visibility filter at all".
+    //
+    // prior_tvec is whatever the solver itself would use this frame
+    // - either the cached last-accepted translation (have_prior=
+    // true), or the cold-start fallback (0, 0, kDefaultUserZCm). The
+    // cold-start centroid back-projection refinement happens further
+    // down and never runs when blobs<kMinInliers, so the diagnostic
+    // legitimately reflects what the solver was looking at.
+    if ((this_frame % 60) == 0) {
+        const cv::Matx33d R_dbg =
+            head_to_camera_rotation(yaw_rad, pitch_rad, roll_rad);
+        const cv::Vec3d   C_dbg = -(R_dbg.t() * prior_tvec);
+        char buf[320];
+        int  off = std::snprintf(buf, sizeof buf,
+            "[psvr-cam] vis-detail: prior=%s tvec=(%+.1f,%+.1f,%+.1f) "
+            "C_head=(%+.1f,%+.1f,%+.1f) dots=",
+            have_prior ? "fresh" : "cold",
+            prior_tvec(0), prior_tvec(1), prior_tvec(2),
+            C_dbg(0), C_dbg(1), C_dbg(2));
+        for (int i = 0; i < NUM_LEDS && off < (int)sizeof buf; ++i) {
+            const cv::Vec3d to_cam = C_dbg - cv::Vec3d(
+                kLEDModel[i].x, kLEDModel[i].y, kLEDModel[i].z);
+            const double d = kLEDNormals[i].dot(to_cam);
+            off += std::snprintf(buf + off, sizeof buf - off,
+                                 " [%d]%+.1f", i, d);
+        }
+        std::fprintf(stderr, "%s\n", buf);
+    }
+
+    if ((int)blobs.size() < kMinInliers) {
+        r.reject_reason = "TOO_FEW_BLOBS";
+        if (dbg) {
+            std::array<cv::Point2d, NUM_LEDS> empty_proj{};
+            std::array<bool, NUM_LEDS>        empty_vis{};
+            log_frame(dbg, yaw_rad, pitch_rad, roll_rad, cv::Vec3d(0, 0, 0),
+                      blobs, empty_proj, empty_vis,
+                      0, false, 0, cv::Vec3d(0, 0, 0), "REJECT_TOO_FEW_BLOBS");
+        }
+        return r;
     }
 
     const cv::Matx33d R = head_to_camera_rotation(yaw_rad, pitch_rad, roll_rad);
