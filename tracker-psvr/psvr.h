@@ -127,19 +127,25 @@ private:
     // one to two orders of magnitude. Touched only by the HID report
     // thread except for the atomic guard, which gates whether the filter
     // publishes poses to opentrack.
-    static constexpr int CALIB_SAMPLES = 400;   // ~2s at 200Hz (2 groups per 100Hz report)
+    // ~1s at 200Hz (2 groups per 100Hz report). Was 400 (~2s); halved
+    // to cut the perceived "Calibrating..." banner time from ~3s to
+    // ~1.5s. Bias-estimate standard deviation scales as 1/sqrt(N), so
+    // halving N raises gyro-bias error from ~0.07 dps to ~0.10 dps -
+    // adds a few deg/min to long-term yaw drift, which is well below
+    // the cm-scale corrections the camera path provides anyway.
+    static constexpr int CALIB_SAMPLES = 200;
 
-    // Discard the first second of HID samples after the stream starts
+    // Discard the first 0.5s of HID samples after the stream starts
     // before we begin averaging for the gyro-bias estimate. Rationale:
     // the PSVR's IMU appears to deliver a short transient (inconsistent
     // DT, stale or partially-initialized values) for the first few
     // hundred ms after the 0x17/0x11 activation burst completes. Those
     // samples are real-looking but systematically biased, and averaging
-    // them in produces a slightly worse bias estimate than the same
-    // 400 samples taken one second later. One second (200 samples at
-    // 200 Hz) is plenty to get past the transient without making the
-    // whole calibration noticeably longer.
-    static constexpr int CALIB_WARMUP_SAMPLES = 200;
+    // them in produces a slightly worse bias estimate. The original 1s
+    // warmup was conservative; the documented transient is "first few
+    // hundred ms", so 0.5s (100 samples at 200 Hz) still clears it
+    // and shaves perceived startup time.
+    static constexpr int CALIB_WARMUP_SAMPLES = 100;
     int calib_warmup_count_{0};
 
     std::atomic<bool> calibrated_{false};
