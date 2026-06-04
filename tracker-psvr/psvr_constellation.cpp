@@ -227,10 +227,14 @@ constexpr int    kMinInliers            = 4;
 // frame). The jump gate can't catch a false first-lock - there's
 // nothing to jump from - so the only defense is to demand the
 // matcher identify a substantial majority of the 9 LEDs before
-// publishing any position. 6 / 9 = 67% is the lowest count that
-// rules out the common "3-blob coincidence" failure mode where a
-// trio of room lights happens to fit a wrong pose.
-constexpr int    kStrongLockMinInliers  = 6;
+// publishing any position. Lowered from 6 to 5 because at most camera
+// angles only 5-7 of the 9 LEDs are physically visible (the rear strap
+// pair filtered out, plus 0-2 more occluded by helmet pitch/yaw). At
+// 6 we silently rejected every match for typical user poses where the
+// helmet exposes 5 LEDs. 5 still rules out the "3-blob coincidence"
+// failure mode (4 inliers would let it through; we keep 5 as a safety
+// margin) without being unreachable in practice.
+constexpr int    kStrongLockMinInliers  = 5;
 constexpr double kStalenessResetSec     = 1.0;  // prior expires after
 constexpr double kDefaultUserZCm        = 60.0; // cold-start Z guess
 // Z sanity bounds. Was [20, 200] cm. Tightened to [30, 120]: a
