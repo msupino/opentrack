@@ -17,6 +17,30 @@ if(APPLE)
         "-framework CoreVideo"
         "-framework QuartzCore")
 
+    # PS4 Camera (OV580) firmware uploader. Always built into the
+    # plugin: this is part of what tracker-psvr is for - users who
+    # plug in a PS4 Camera via the PS4-to-PS5 adapter need the
+    # firmware blob shipped to the device before AVFoundation can
+    # see it as a webcam.
+    #
+    # libusb is the only external dependency. Located via the repo's
+    # opentrack-pkg-config helper (which itself wraps FindPkgConfig);
+    # the helper is normally only included on Linux by
+    # cmake/opentrack-platform.cmake, but pkg-config works just as
+    # well on macOS for finding Homebrew's libusb, so we include it
+    # locally here without polluting other Apple-only modules.
+    include(opentrack-pkg-config)
+    pkg_check_modules(LIBUSB REQUIRED libusb-1.0)
+    target_sources(${self} PRIVATE
+        ps4cam_firmware.mm
+        ps4cam_firmware.h
+        ps4cam_firmware_blob.h)
+    set_source_files_properties(ps4cam_firmware.mm PROPERTIES
+        COMPILE_FLAGS "-fobjc-arc")
+    target_include_directories(${self} SYSTEM PRIVATE ${LIBUSB_INCLUDE_DIRS})
+    target_link_libraries(${self} PRIVATE ${LIBUSB_LIBRARIES})
+    target_link_directories(${self} PRIVATE ${LIBUSB_LIBRARY_DIRS})
+
     # Optional: LED-constellation position tracking via webcam.
     #
     # The PSVR lights up 9 blue LEDs on its front visor + rear strap when
