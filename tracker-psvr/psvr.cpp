@@ -16,6 +16,10 @@
 // that transitively includes the tracker header (only psvr.cpp needs
 // them).
 #include "psvr_camera.h"
+// PS4 Camera (OV580) firmware uploader: brings a boot-mode PS4 Camera
+// up as a UVC webcam before the dialog populates its camera dropdown
+// so the device actually appears in the list. See ps4cam_firmware.h.
+#include "ps4cam_firmware.h"
 #endif
 
 #include "compat/camera-names.hpp"
@@ -1508,18 +1512,62 @@ PSVRDialog::PSVRDialog()
         cam_row->setContentsMargins(24, 0, 0, 0);
         auto* cam_lbl = new QLabel(QObject::tr("Camera"));
         camera_name_box_ = new QComboBox();
-        camera_name_box_->addItem(QObject::tr("(default camera)"), QString());
-        for (const auto& [name, idx] : get_camera_names()) {
-            (void)idx;
-            camera_name_box_->addItem(name, name);
-        }
-        // Make sure the saved name is selectable even if the device is
-        // currently unplugged: addItem it as a stand-alone entry so the
-        // user sees what they picked last time instead of silently
-        // reverting to "(default camera)".
-        const QString saved = s_.camera_name;
-        if (!saved.isEmpty() && camera_name_box_->findText(saved) < 0)
-            camera_name_box_->addItem(saved + QObject::tr(" (not connected)"), saved);
+
+        // If a PS4 Camera is plugged in but still in OV580 Boot Mode,
+        // upload its firmware before enumerating cameras so it appears
+        // in the dropdown. Idempotent and silent when no such device
+        // is present (common case). ensure_firmware_uploaded() blocks
+        // briefly (up to ~3 s) only when an upload actually happens;
+        // that's a one-time UX cost for a user who just plugged in
+        // a PS4 Camera and opened settings — exactly the moment they
+        // want it to be ready.
+#ifdef PSVR_HAS_CAMERA
+        (void)ps4cam::ensure_firmware_uploaded();
+#endif
+
+        // Lambda so we can re-run the populate after a delayed timer.
+        // (See QTimer::singleShot below.) Rebuilds the items from the
+        // current AVFoundation device list while preserving the
+        // currently-selected name where possible.
+        auto repopulate_camera_names = [this]() {
+            if (!camera_name_box_) return;
+            const QString prev = camera_name_box_->currentData().toString();
+            QSignalBlocker block(camera_name_box_);
+            camera_name_box_->clear();
+            camera_name_box_->addItem(QObject::tr("(default camera)"), QString());
+            for (const auto& [name, idx] : get_camera_names()) {
+                (void)idx;
+                camera_name_box_->addItem(name, name);
+            }
+            // Make sure the saved name is selectable even if the device
+            // is currently unplugged: addItem it as a stand-alone entry
+            // so the user sees what they picked last time instead of
+            // silently reverting to "(default camera)".
+            const QString saved = s_.camera_name;
+            if (!saved.isEmpty() && camera_name_box_->findText(saved) < 0)
+                camera_name_box_->addItem(saved + QObject::tr(" (not connected)"), saved);
+            // Restore selection (prefer the in-flight UI value over the
+            // saved one, so a user who already clicked the dropdown
+            // before the re-populate fires doesn't have their choice
+            // clobbered by us).
+            const QString want = !prev.isEmpty() ? prev : saved;
+            int idx = camera_name_box_->findData(want);
+            if (idx < 0) idx = camera_name_box_->findText(want);
+            if (idx >= 0) camera_name_box_->setCurrentIndex(idx);
+        };
+        repopulate_camera_names();
+
+        // Belt-and-suspenders for the case where ensure_firmware_uploaded()
+        // above returned before macOS's UVC subsystem finished publishing
+        // the newly-booted PS4 Camera: re-enumerate once after 2.5 s so
+        // the device shows up in the dropdown without the user having to
+        // close and reopen the dialog. No-op (cheap re-enumeration) when
+        // nothing changed in the meantime. Parented to `this` so the
+        // timer is destroyed with the dialog and can't fire after.
+#ifdef PSVR_HAS_CAMERA
+        QTimer::singleShot(2500, this, repopulate_camera_names);
+#endif
+
         cam_row->addWidget(cam_lbl);
         cam_row->addWidget(camera_name_box_, 1);
         layout->addLayout(cam_row);

@@ -59,6 +59,7 @@
  */
 #import "psvr_camera.h"
 #import "psvr_constellation.h"
+#import "ps4cam_firmware.h"
 
 #import <Foundation/Foundation.h>
 #import <AVFoundation/AVFoundation.h>
@@ -518,6 +519,15 @@ static AVCaptureDevice* pick_camera(const std::string& desired)
 
 bool Worker::start() {
     if (impl_->running.load()) return true;
+
+    // If a PS4 Camera is plugged in but still in OV580 Boot Mode, ship
+    // the firmware and wait for it to re-enumerate as a UVC device
+    // before we ask AVFoundation what cameras are connected. Without
+    // this, the device is invisible to pick_camera() below and the
+    // user's "PS4 Camera" selection silently falls back to the
+    // default camera. Idempotent and cheap (silent no-op) when no
+    // PS4 Camera is present, which is the common case.
+    (void)ps4cam::ensure_firmware_uploaded();
 
     @autoreleasepool {
         AVCaptureDevice* dev = pick_camera(impl_->desired_camera_name);
