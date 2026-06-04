@@ -144,7 +144,28 @@ static constexpr double BLOB_MIN_CIRCULARITY = 0.0;
 // rounded up for blur halos.
 static constexpr int BRIGHT_THRESH_FLOOR = 180;
 static constexpr int BRIGHT_THRESH_CEIL  = 250;
-static constexpr int N_TARGET_BRIGHT_PIXELS = 1500;
+// Dropped from 1500 to 100 because field testing showed a bright
+// monitor/window in-frame eats most of the 1500-pixel budget,
+// landing the threshold low enough that LED *halos* fall below it
+// while their saturated cores barely scrape over - and 2-pixel-core
+// LEDs are then indistinguishable from sensor hot-pixel noise that
+// also sits just above the threshold. Targeting the top 100 brightest
+// pixels lands the threshold near V=250+, which captures only the
+// actual LED cores and the very brightest tip of any monitor/lamp
+// (typically <100 pixels' worth of saturated-white). Combined with
+// MORPH_DILATE below, each LED's 2-px core becomes a 4-px blob the
+// area gate accepts.
+// Lowered again from 100 to 40 after field-testing showed 100 still
+// admitted ~35 noise/sensor-hot pixels per frame on top of the ~5
+// real LED cores - the matcher would then find two geometrically
+// valid solutions (~5cm and ~45cm Z) and oscillate. 40 lands the
+// threshold near V=250+, capturing only the very tip of the LED
+// signal and the few brightest noise pixels. With dilate(3x3) below,
+// each LED core grows into a clean 4-6 px blob; noise pixels
+// become isolated 3x3 blobs that the matcher filters out via
+// inlier scoring far more reliably at signal/noise = 5/(5+5) = 50%
+// vs the old 5/40 = 12%.
+static constexpr int N_TARGET_BRIGHT_PIXELS = 40;
 
 // Pick a brightness threshold by walking the histogram from V=255
 // down until cumulative pixel count reaches N_TARGET_BRIGHT_PIXELS.
@@ -547,19 +568,99 @@ bool Worker::start() {
         }
 
         AVCaptureSession* session = [[AVCaptureSession alloc] init];
-        session.sessionPreset = AVCaptureSessionPreset1280x720;
+        // Don't hard-code AVCaptureSessionPreset1280x720: the PS4 Camera
+        // (OV580 stereo cam) has no 1280x720 mode - its native formats
+        // are 1748x408, 896x500, 640x400, 320x192. Forcing a non-
+        // native preset produced misaligned BGRA frames that look like
+        // a diagonal-streak "weave" in the preview. Prefer the camera's
+        // own format negotiation: try the standard "High" preset (which
+        // means "best resolution this device supports"), and if even
+        // that doesn't fit, fall back to whatever the device picks.
+        if ([session canSetSessionPreset:AVCaptureSessionPresetHigh])
+            session.sessionPreset = AVCaptureSessionPresetHigh;
+        else if ([session canSetSessionPreset:AVCaptureSessionPresetMedium])
+            session.sessionPreset = AVCaptureSessionPresetMedium;
+        // Otherwise leave sessionPreset at its default and let the
+        // device's activeFormat decide.
+
         if (![session canAddInput:input]) {
             std::fprintf(stderr, "[psvr-cam] session refused camera input\n");
             return false;
         }
         [session addInput:input];
 
+        // Picky-camera activeFormat selection. The OV580 (PS4 Camera)
+        // advertises 1748x408, 896x500, 640x400, and 320x192. The
+        // higher-res modes pack both lenses into one frame with row
+        // padding that breaks the YUYV decoder; force the camera to
+        // the smallest single-lens mode (640x400) where the data is
+        // a clean BGR-able scanline. Generic webcams (UGREEN, FaceTime,
+        // etc.) are left at whatever the sessionPreset negotiated -
+        // they don't have this problem.
+        //
+        // We pick by (a) sensible dimensions for tracking (target
+        // 640 wide, prefer <= 1280) and (b) avoiding tile-packed
+        // modes (height < 200 is a give-away that the format is
+        // sub-lens / non-image).
+        {
+            AVCaptureDeviceFormat* best = nil;
+            int                    best_score = -1;
+            for (AVCaptureDeviceFormat* fmt in dev.formats) {
+                CMVideoDimensions dim =
+                    CMVideoFormatDescriptionGetDimensions(fmt.formatDescription);
+                if (dim.height < 200) continue;  // skip sub-lens / weird
+                if (dim.width > 1280) continue;  // skip wide stereo packs
+                // Prefer 640x400 (the OV580 single-lens sweet spot),
+                // otherwise score closer-to-target higher.
+                const int target_w = 640, target_h = 400;
+                int score = 10000
+                            - std::abs(dim.width  - target_w)
+                            - std::abs(dim.height - target_h);
+                if (score > best_score) {
+                    best_score = score;
+                    best       = fmt;
+                }
+            }
+            if (best && [dev lockForConfiguration:nil]) {
+                dev.activeFormat = best;
+                [dev unlockForConfiguration];
+            }
+        }
+
+        // Log what the device actually settled on so we can debug
+        // pixel-format / dimension mismatches without a debugger.
+        {
+            AVCaptureDeviceFormat* fmt = dev.activeFormat;
+            CMVideoDimensions dim = CMVideoFormatDescriptionGetDimensions(
+                fmt.formatDescription);
+            FourCharCode codec = CMFormatDescriptionGetMediaSubType(
+                fmt.formatDescription);
+            char c[5] = {
+                (char)((codec >> 24) & 0xff), (char)((codec >> 16) & 0xff),
+                (char)((codec >> 8) & 0xff),  (char)(codec & 0xff), 0};
+            std::fprintf(stderr,
+                "[psvr-cam] active format: %dx%d fourcc='%s'\n",
+                dim.width, dim.height, c);
+        }
+
         AVCaptureVideoDataOutput* output = [[AVCaptureVideoDataOutput alloc] init];
         output.alwaysDiscardsLateVideoFrames = YES;
         // Ask for packed BGRA so OpenCV can wrap the IOSurface directly
         // without a color-space conversion pass.
+        // Pixel format. We used to ask for 32BGRA which let macOS's
+        // Core Video subsystem do the YUV->BGRA conversion - but that
+        // converter has a SIMD fast path that assumes width is a
+        // multiple of 16, and produces diagonal-streak garbage on the
+        // PS4 Camera (OV580) whose native modes are 1748x408 and
+        // 896x500 (neither a multiple of 16). Asking for the camera's
+        // native YUV422 ('yuvs') format and doing the conversion
+        // ourselves with cv::cvtColor sidesteps that bug for any
+        // odd-width camera. Normal webcams (UGREEN, FaceTime, etc.)
+        // also offer yuvs natively, so this is a no-cost change for
+        // them.
         output.videoSettings = @{
-            (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA)
+            (id)kCVPixelBufferPixelFormatTypeKey :
+                @(kCVPixelFormatType_422YpCbCr8_yuvs)
         };
 
         dispatch_queue_t q = dispatch_queue_create(
@@ -613,18 +714,90 @@ static void process_frame(Worker::Impl* s, CVPixelBufferRef buf) {
     const int stride = (int)CVPixelBufferGetBytesPerRow(buf);
     uint8_t* base = (uint8_t*)CVPixelBufferGetBaseAddress(buf);
 
-    // Zero-copy wrap of the BGRA plane. cv::Mat doesn't take ownership
-    // so the IOSurface stays valid as long as we hold the pixel-buffer
-    // lock. We do NOT modify bgra_view; we derive owned copies from it.
-    cv::Mat bgra(h, w, CV_8UC4, base, stride);
+    // Diagnostic: log the actual pixel format of incoming frames, once.
+    // AVFoundation sometimes silently ignores videoSettings and delivers
+    // a different format; this log line tells us conclusively what
+    // arrived so we don't try to interpret 32BGRA as YUYV (or vice versa).
+    {
+        static bool announced = false;
+        if (!announced) {
+            announced = true;
+            OSType fmt = CVPixelBufferGetPixelFormatType(buf);
+            char c[5] = {
+                (char)((fmt >> 24) & 0xff), (char)((fmt >> 16) & 0xff),
+                (char)((fmt >> 8) & 0xff),  (char)(fmt & 0xff), 0};
+            std::fprintf(stderr,
+                "[psvr-cam] incoming frame format: fourcc='%s' (0x%08x), "
+                "%dx%d stride=%d (=%d bytes/pixel)\n",
+                c, (unsigned)fmt, w, h, stride,
+                h > 0 ? stride / std::max(1, w) : 0);
+        }
+    }
 
-    // Convert to an OpenCV-owned BGR buffer immediately. After this
-    // line we no longer depend on the IOSurface and can unlock it.
-    // We also need a BGR copy below for the BGR->grayscale conversion
-    // (extractor input) and for overlay drawing, so doing it once
-    // up-front is strictly cheaper than the previous arrangement
-    // (split-then-copy-later).
-    cv::cvtColor(bgra, s->bgr_owned, cv::COLOR_BGRA2BGR);
+    // Decode the packed-YUYV ('yuvs') plane to BGR.
+    //
+    // The OV580 (PS4 Camera) does NOT deliver a plain scanline image.
+    // Per the ps4eye / PS4EYECam reverse-engineering (ps4eye.cpp's
+    // de-interleave, memcpy at +32+64), every row is laid out as:
+    //
+    //   [32 B header][64 B header][LEFT eye ew*2 B][RIGHT eye ew*2 B][junk]
+    //
+    // and only `ih` of the reported rows carry image (the rest are
+    // metadata). Treating the whole reported WxH as a single YUYV
+    // image is what produced the diagonal-streak shear - the 96-byte
+    // per-row header offsets each row progressively. We extract just
+    // the LEFT eye into a packed buffer and decode that.
+    //
+    //   reported width   eye width (ew)   image height (ih)
+    //        3448             1280              800
+    //        1748              640              400
+    //         898              320              200
+    //
+    // (YUYV, not UYVY, confirmed: COLOR_YUV2BGR_UYVY gave magenta/green.)
+    auto ov580_dims = [](int rw, int& ew, int& ih) -> bool {
+        if (rw == 3448) { ew = 1280; ih = 800; return true; }
+        if (rw == 1748) { ew =  640; ih = 400; return true; }
+        if (rw ==  898) { ew =  320; ih = 200; return true; }
+        return false;
+    };
+    int eye_w = 0, eye_h = 0;
+    if (ov580_dims(w, eye_w, eye_h)) {
+        static bool announced = false;
+        if (!announced) {
+            std::fprintf(stderr,
+                "[psvr-cam] OV580 frame %dx%d: de-interleaving left eye "
+                "%dx%d (row=%dB packed, skip 96B/row header)\n",
+                w, h, eye_w, eye_h, w * 2);
+            announced = true;
+        }
+        // CRITICAL: the OV580 image data is packed CONTIGUOUSLY at
+        // w*2 bytes per row (3496 for the 1748-wide mode), NOT at the
+        // stride CVPixelBufferGetBytesPerRow() reports (3520). The
+        // 3520 figure is the buffer's allocation row size; the actual
+        // pixel data has no per-row padding (the slack is all trailing).
+        // Stepping by the reported 3520 drifts 24 bytes (12 px) per row
+        // and shears the whole image diagonally - verified empirically
+        // by reshaping a raw dump: a 12-px/row shift vanishes at a
+        // 3496-byte row pitch. So we step by `row_bytes = w * 2`.
+        //
+        // Within each contiguous row: [32B+64B header][LEFT eye ew*2 B]
+        // [RIGHT eye ew*2 B][junk]. Extract the left eye's YUYV and
+        // decode it.
+        const int    row_bytes = w * 2;       // 3496 for 1748-wide mode
+        const int    kHdrBytes = 32 + 64;     // per-row header
+        cv::Mat left(eye_h, eye_w, CV_8UC2);
+        for (int y = 0; y < eye_h; ++y) {
+            std::memcpy(left.ptr(y),
+                        base + (size_t)y * row_bytes + kHdrBytes,
+                        (size_t)eye_w * 2);
+        }
+        cv::cvtColor(left, s->bgr_owned, cv::COLOR_YUV2BGR_YUYV);
+    } else {
+        // Ordinary webcam delivering plain packed YUYV. Decode at the
+        // true memory width (stride/2) so SIMD row alignment is correct.
+        cv::Mat yuyv(h, stride / 2, CV_8UC2, base, stride);
+        cv::cvtColor(yuyv, s->bgr_owned, cv::COLOR_YUV2BGR_YUYV);
+    }
 
     CVPixelBufferUnlockBaseAddress(buf, kCVPixelBufferLock_ReadOnly);
 
@@ -644,12 +817,16 @@ static void process_frame(Worker::Impl* s, CVPixelBufferRef buf) {
     const int bright_thresh = adaptive_bright_threshold(s->gray);
     cv::threshold(s->gray, s->mask, bright_thresh, 255, cv::THRESH_BINARY);
 
-    // DIAGNOSTIC: morph_open dropped to 2x2 from 3x3 and area gate
-    // dropped (see BLOB_MIN_AREA_PX) to admit small LED projections.
-    // Reverts to {3,3} once we know the LEDs are reaching the
-    // extractor as bright pixels.
-    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, {2, 2});
-    cv::morphologyEx(s->mask, s->mask, cv::MORPH_OPEN, kernel);
+    // Field-tuned: switched from MORPH_OPEN(2x2) to MORPH_DILATE(3x3).
+    // Open (erode-then-dilate) was eating the 1-2 pixel LED cores -
+    // a 2x2 erode of a 2x2 blob leaves nothing for dilate to grow back.
+    // Plain dilate (no erode) GROWS each LED's saturated core by 1 px
+    // on every side, taking a 2x2 core to 4x4, comfortably above the
+    // area gate. Isolated noise hot-pixels also grow to 3x3 but the
+    // tighter N_TARGET_BRIGHT_PIXELS (100) above means very few of
+    // them appear in the first place, so the signal/noise stays good.
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, {3, 3});
+    cv::dilate(s->mask, s->mask, kernel);
 
     // Diagnostic: report the actual brightness range the camera is
     // delivering, ONCE per second (~30 frames). Reveals AVFoundation
