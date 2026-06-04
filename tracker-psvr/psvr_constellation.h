@@ -41,8 +41,11 @@ struct Result {
 
     // Short tag identifying the path that produced this Result. One
     // of: "OK", "TOO_FEW_BLOBS", "TOO_FEW_VISIBLE", "NO_AP3P_FIT",
-    // "RANSAC_FEW_INLIERS", "HIGH_RMS", "Z_OUT_OF_RANGE", "JUMP",
-    // "WEAK_FIRST_LOCK".
+    // "RANSAC_FEW_INLIERS", "T_SOLVE_DIVERGED", "HIGH_RMS",
+    // "Z_OUT_OF_RANGE", "JUMP", "WEAK_FIRST_LOCK".
+    // "T_SOLVE_DIVERGED" comes from the IMU-rotation-locked
+    // translation-only Gauss-Newton path (rotation fixed to the IMU,
+    // only t solved); the others from the free-rotation fallback.
     // Lifetime: points to a static string literal owned by the
     // solver; safe to copy or dereference without ownership tracking.
     // Used by the camera worker's periodic [psvr-cam] stderr summary
@@ -89,7 +92,14 @@ public:
     //
     // blobs:         image-space centroids in pixels
     // img_w, img_h:  frame dimensions (for camera-intrinsics default)
-    // yaw/pitch/roll_rad: IMU rotation prior in radians.
+    // yaw/pitch/roll_rad: IMU rotation. Used both to seed/filter the
+    //                correspondence search AND, in the normal path, as
+    //                the FIXED rotation for the final solve: the pose's
+    //                rotation is held to head_to_camera_rotation() and
+    //                only translation is fit, which collapses the
+    //                planar-PnP two-fold ambiguity. If all three are 0
+    //                and there's no prior (helmet not streaming) the
+    //                solver falls back to free-rotation PnP.
     // hfov_deg:      camera horizontal field of view, in degrees,
     //                used to build the pinhole intrinsics. Defaults
     //                to 70 deg when omitted, matching the legacy
