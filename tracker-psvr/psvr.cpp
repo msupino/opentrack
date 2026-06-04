@@ -441,6 +441,11 @@ module_status PSVRTracker::start_tracker(QFrame* frame)
         // trip the Z-sanity gate for wide-FOV cameras (UGREEN,
         // GoPro) before the dialog's hot-apply caught up.
         camera_worker_->set_hfov_deg(s_.camera_hfov_deg);
+        // Auto-HFOV: when enabled, the worker overrides the manual value
+        // above inside start() using recommended_hfov_for_camera() for
+        // the resolved device. set order doesn't matter; the override
+        // only happens once the device name is known inside start().
+        camera_worker_->set_hfov_auto(s_.camera_hfov_auto);
         if (!camera_worker_->start()) {
             qDebug() << "[psvr] camera worker failed to start; position will be zero";
             camera_worker_.reset();
@@ -1615,6 +1620,20 @@ PSVRDialog::PSVRDialog()
         layout->addWidget(hfov_desc);
         tie_setting(s_.camera_hfov_deg, hfov_box_);
 
+        // "Auto" checkbox: pick the HFOV from the detected camera type.
+        // Sits just under the HFOV row, indented to match the camera
+        // sub-section. When checked, the spinbox is disabled and shows
+        // (display-only) the recommended value for the selected camera;
+        // the persisted manual value is left untouched so it's restored
+        // when the user unticks Auto. Default ON.
+        auto* hfov_auto_row = new QHBoxLayout();
+        hfov_auto_row->setContentsMargins(24, 0, 0, 0);
+        hfov_auto_box_ = new QCheckBox(
+            QObject::tr("Auto (set HFOV by camera type)"));
+        hfov_auto_row->addWidget(hfov_auto_box_);
+        layout->addLayout(hfov_auto_row);
+        tie_setting(s_.camera_hfov_auto, hfov_auto_box_);
+
         // Hot-apply: as the user dials the spinbox, push the new
         // value to a running camera worker so they can A/B the
         // tracking distance live. Atomic store inside set_hfov_deg
@@ -1635,17 +1654,51 @@ PSVRDialog::PSVRDialog()
         auto sync_enabled = [this, cam_lbl, cam_desc,
                              hfov_lbl, hfov_desc]() {
             const bool on = camera_box_ && camera_box_->isChecked();
+            const bool autom = hfov_auto_box_ && hfov_auto_box_->isChecked();
             if (cam_lbl)          cam_lbl->setEnabled(on);
             if (camera_name_box_) camera_name_box_->setEnabled(on);
             if (cam_desc)         cam_desc->setEnabled(on);
             if (hfov_lbl)         hfov_lbl->setEnabled(on);
-            if (hfov_box_)        hfov_box_->setEnabled(on);
             if (hfov_desc)        hfov_desc->setEnabled(on);
+            if (hfov_auto_box_)   hfov_auto_box_->setEnabled(on);
+            // Manual spinbox is editable only when the camera is enabled
+            // AND auto is off. While auto is on we show (display-only)
+            // the recommended value for the currently-selected camera so
+            // the user can see what auto will use, but the persisted
+            // manual value (s_.camera_hfov_deg) stays as the user last
+            // set it - hence the QSignalBlocker, which suppresses the
+            // tie_setting writeback. When auto is off we mirror the
+            // persisted manual value back into the display.
+            if (hfov_box_) {
+                hfov_box_->setEnabled(on && !autom);
+                QSignalBlocker block(hfov_box_);
+                if (autom) {
+                    const std::string cam =
+                        camera_name_box_
+                            ? camera_name_box_->currentText().toStdString()
+                            : std::string();
+                    hfov_box_->setValue(
+                        psvr_cam::recommended_hfov_for_camera(cam));
+                } else {
+                    hfov_box_->setValue(s_.camera_hfov_deg);
+                }
+            }
         };
         sync_enabled();
         if (camera_box_) {
             QObject::connect(camera_box_, &QCheckBox::toggled,
                              this, [sync_enabled](bool){ sync_enabled(); });
+        }
+        if (hfov_auto_box_) {
+            QObject::connect(hfov_auto_box_, &QCheckBox::toggled,
+                             this, [sync_enabled](bool){ sync_enabled(); });
+        }
+        // Switching cameras while auto is on must refresh the shown HFOV.
+        if (camera_name_box_) {
+            QObject::connect(
+                camera_name_box_,
+                QOverload<int>::of(&QComboBox::currentIndexChanged),
+                this, [sync_enabled](int){ sync_enabled(); });
         }
     }
 

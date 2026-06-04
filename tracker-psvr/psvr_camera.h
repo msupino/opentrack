@@ -36,6 +36,13 @@
 
 namespace psvr_cam {
 
+// Single source of truth for the per-camera-type recommended HFOV
+// (degrees), used by both the worker's "Auto" mode and the settings
+// dialog's informational display. Case-insensitive substring match on
+// the camera's localizedName. Centralised here so the numbers live in
+// exactly one place - never duplicate this table in the dialog.
+double recommended_hfov_for_camera(const std::string& localized_name);
+
 // Per-frame camera-tracking result.
 struct Result {
     // Head origin in the OpenCV camera frame, cm:
@@ -103,6 +110,14 @@ public:
     // changes from the Qt UI thread while the camera worker reads
     // on its dispatch queue. Default if never set is 70 deg.
     void set_hfov_deg(double hfov_deg);
+
+    // Auto-HFOV mode toggle. When true, start() overrides the manual
+    // HFOV (set via set_hfov_deg) with recommended_hfov_for_camera()
+    // applied to the actually-resolved capture device's localizedName -
+    // the only place the resolved device name is known. When false the
+    // manual value is used unchanged. Written from the Qt UI thread
+    // before start(); backed by std::atomic<bool>. Default true.
+    void set_hfov_auto(bool enabled);
 
     // Idempotent. Always safe to call.
     void stop();

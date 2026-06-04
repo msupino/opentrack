@@ -74,8 +74,32 @@
 #include <chrono>
 #include <cstdio>
 #include <limits>
+#include <algorithm>
+#include <cctype>
 
 namespace psvr_cam {
+
+// Single source of truth for per-camera-type HFOV defaults. Matched
+// case-insensitively as a substring of the camera's localizedName.
+// These numbers live here and ONLY here; the dialog and the worker
+// both call this function rather than carrying their own copies.
+double recommended_hfov_for_camera(const std::string& localized_name) {
+    std::string n = localized_name;
+    std::transform(n.begin(), n.end(), n.begin(),
+                   [](unsigned char c){ return (char)std::tolower(c); });
+    auto has = [&](const char* needle) {
+        std::string s(needle);
+        std::transform(s.begin(), s.end(), s.begin(),
+                       [](unsigned char c){ return (char)std::tolower(c); });
+        return n.find(s) != std::string::npos;
+    };
+    if (has("ov580"))       return 85.0;  // PS4 Camera (OV580) per-lens HFOV
+    if (has("playstation")) return 85.0;  // safety alias for PS Camera naming
+    if (has("ugreen"))      return 80.0;  // UGREEN USB webcam
+    if (has("facetime"))    return 78.0;  // Apple FaceTime HD
+    if (has("macbook"))     return 78.0;  // built-in MacBook (Pro) lid camera
+    return 70.0;                          // generic webcam default
+}
 
 // Freshness window for publish/consume. Camera runs at ~30 Hz; we allow
 // up to ~15 frames (~500 ms) of staleness before the reader treats the
@@ -355,6 +379,13 @@ struct Worker::Impl {
     // dispatch queue every frame. Atomic so the cross-thread store/
     // load is well-defined without needing a mutex on the hot path.
     std::atomic<double> desired_hfov_deg{70.0};
+
+    // Auto-HFOV mode. When true, start() overrides desired_hfov_deg
+    // with recommended_hfov_for_camera() for the resolved device.
+    // Written from the Qt UI thread before start(); read in start()
+    // on the camera thread. Atomic for a well-defined cross-thread
+    // store/load. Default true (most users want HFOV to just work).
+    std::atomic<bool> desired_hfov_auto{true};
 };
 
 Worker::Worker() : impl_(std::make_unique<Impl>()) {}
@@ -374,6 +405,10 @@ void Worker::set_hfov_deg(double hfov_deg) {
     if (hfov_deg < 40.0)  hfov_deg = 40.0;
     if (hfov_deg > 130.0) hfov_deg = 130.0;
     impl_->desired_hfov_deg.store(hfov_deg, std::memory_order_relaxed);
+}
+
+void Worker::set_hfov_auto(bool enabled) {
+    impl_->desired_hfov_auto.store(enabled, std::memory_order_relaxed);
 }
 
 void Worker::set_rotation_prior(double yaw, double pitch, double roll) {
@@ -555,6 +590,20 @@ bool Worker::start() {
         if (!dev) {
             std::fprintf(stderr, "[psvr-cam] no camera device available\n");
             return false;
+        }
+
+        // Auto-HFOV: now that the actual capture device is resolved (the
+        // only place its localizedName is known), override the manual
+        // HFOV with the per-camera-type recommendation. Reuses the
+        // existing clamp inside set_hfov_deg. When auto is off we leave
+        // desired_hfov_deg as the dialog's manual spinbox value.
+        if (impl_->desired_hfov_auto.load(std::memory_order_relaxed)) {
+            const double auto_hfov = recommended_hfov_for_camera(
+                dev.localizedName.UTF8String);
+            set_hfov_deg(auto_hfov);
+            std::fprintf(stderr,
+                "[psvr-cam] auto HFOV: %.1f deg for \"%s\"\n",
+                auto_hfov, dev.localizedName.UTF8String);
         }
 
         NSError* err = nil;

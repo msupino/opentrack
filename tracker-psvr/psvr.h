@@ -87,6 +87,13 @@ struct psvr_settings : opts {
     // the z-sanity gate. Default 70 reproduces the legacy
     // hard-coded behavior so unmigrated profiles are unaffected.
     value<double>  camera_hfov_deg;
+    // Auto-select the HFOV from the detected camera type rather than
+    // using the manual value above. Default ON so most users get a
+    // sensible HFOV without touching anything; unticking it re-enables
+    // the manual spinbox. The manual value persists either way so it's
+    // restored when auto is turned back off. See
+    // psvr_cam::recommended_hfov_for_camera for the mapping.
+    value<bool>    camera_hfov_auto;
     psvr_settings() :
         opts("psvr-tracker"),
         // Default OFF: turning the mirror on is what triggers macOS's
@@ -101,7 +108,8 @@ struct psvr_settings : opts {
         keepalive_cmd(b, "keepalive-cmd", QStringLiteral("0x1F")),
         keepalive_interval_s(b, "keepalive-interval-s", 60),
         camera_name(b, "camera-name", {}),
-        camera_hfov_deg(b, "camera-hfov-deg", 70.0)
+        camera_hfov_deg(b, "camera-hfov-deg", 70.0),
+        camera_hfov_auto(b, "camera-hfov-auto", true)
     {}
 };
 
@@ -533,6 +541,11 @@ private:
     // the running camera worker on (re)start and (when wired) on
     // valueChanged. Defined in psvr.cpp's PSVRDialog ctor.
     class QDoubleSpinBox* hfov_box_{nullptr};
+    // "Auto" checkbox: when checked, the HFOV spinbox is disabled and
+    // shows the recommended value for the currently-selected camera
+    // (display-only; the persisted manual value is untouched). Wired to
+    // s_.camera_hfov_auto via tie_setting. Defined in psvr.cpp.
+    class QCheckBox* hfov_auto_box_{nullptr};
     // Held as a member so set_buttons_visible() can hide it when this
     // dialog is rendered as an embedded tab inside the global Options
     // dialog (which provides its own OK/Cancel and would otherwise stack
