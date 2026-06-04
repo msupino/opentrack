@@ -432,8 +432,17 @@ module_status PSVRTracker::start_tracker(QFrame* frame)
         // start(): the AVFoundation device lookup happens inside
         // start() and reads desired_camera_name_ exactly once. Empty
         // string keeps the legacy defaultDeviceWithMediaType: path.
-        camera_worker_->set_desired_camera_name(
-            QString(s_.camera_name).toStdString());
+        //
+        // Defensively strip any " (not connected)" suffix that an older
+        // build may have persisted into the setting, so the worker
+        // always gets the clean device name to match against.
+        {
+            QString cam = s_.camera_name;
+            const QString kNotConnected = QStringLiteral(" (not connected)");
+            while (cam.endsWith(kNotConnected))
+                cam.chop(kNotConnected.size());
+            camera_worker_->set_desired_camera_name(cam.toStdString());
+        }
         // Push the dialog-selected HFOV to the worker BEFORE start()
         // so the very first frame's constellation solve uses the
         // right intrinsics. Without this the first ~1 s of frames
@@ -1548,9 +1557,28 @@ PSVRDialog::PSVRDialog()
             // is currently unplugged: addItem it as a stand-alone entry
             // so the user sees what they picked last time instead of
             // silently reverting to "(default camera)".
-            const QString saved = s_.camera_name;
-            if (!saved.isEmpty() && camera_name_box_->findText(saved) < 0)
-                camera_name_box_->addItem(saved + QObject::tr(" (not connected)"), saved);
+            //
+            // The saved value can have accumulated one or more
+            // " (not connected)" suffixes if a prior session persisted
+            // the placeholder item's *display text* (the original code
+            // matched on findText and the suffix compounded each
+            // populate). Strip every such suffix so we compare/store
+            // the real device name, and write the cleaned value back so
+            // a corrupted ini self-heals.
+            const QString kNotConnected = QObject::tr(" (not connected)");
+            QString saved = s_.camera_name;
+            bool healed = false;
+            while (saved.endsWith(kNotConnected)) {
+                saved.chop(kNotConnected.size());
+                healed = true;
+            }
+            if (healed)
+                s_.camera_name = saved;
+            // Match on item DATA (the real device name), not display
+            // text, so the connected camera is correctly recognised and
+            // we don't add a bogus "(not connected)" duplicate for it.
+            if (!saved.isEmpty() && camera_name_box_->findData(saved) < 0)
+                camera_name_box_->addItem(saved + kNotConnected, saved);
             // Restore selection (prefer the in-flight UI value over the
             // saved one, so a user who already clicked the dropdown
             // before the re-populate fires doesn't have their choice
