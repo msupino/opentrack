@@ -114,3 +114,41 @@ The keepalive is:
 | PSVR control box HDMI passthrough is off when the box is off | If they see "no image" on the headset, suggest bypassing the box and plugging HDMI directly into the helmet to isolate whether the box is the issue. |
 | Processor-unit cold-boot handshake takes 5–15 s after Start | The watchdog should not surface an error until ~25 s. Premature error banners confuse users into unplugging while the box is still negotiating. |
 | Auto-sleep mid-session | See HID keepalive above. Even with it on, max delay is ~2 min. |
+
+## PS4 Camera (OV580) — camera-based positional tracking
+
+The optional camera path tracks the helmet's 9 blue LEDs for X/Y/Z. The
+**PS4 Camera** (Sony's stereo cam, OV580 ASIC) is the right hardware for
+it (blue-tuned IR-cut filter). Key facts:
+
+- **USB 3.0 only.** It will NOT enumerate behind a USB 2.0 hub (e.g. the
+  Honeycomb XPC / GenesysLogic "USB2.1 Hub"). Plug into a native
+  SuperSpeed port or a *powered* USB 3.0 hub. Verify:
+  `ioreg -p IOUSB -l | grep UsbLinkSpeed` → want `5000000000`, not
+  `480000000`. At 2.0 the OV580 won't even show in Boot mode.
+- **One-time firmware upload per power cycle.** Until uploaded it
+  enumerates as `USB Boot` (no camera). tracker-psvr embeds the blob and
+  uploads it via libusb on tracker start. Manual tool:
+  `psmove camera-firmware` (thp/psmoveapi); retry once if it returns
+  `-4`/`-7` mid-re-enumeration. After upload it appears as a UVC webcam
+  `USB Camera-OV580`. Firmware blob from ps4eye/ps4eye (SHA-1
+  `fe86162309518a0ffe267075a2fcf728c5856b3e`).
+- **Frame layout (de-interleave).** AVFoundation delivers the native
+  `yuvs` (YUYV) frame; the image data is packed CONTIGUOUSLY at `w*2`
+  bytes/row (NOT the reported `CVPixelBufferGetBytesPerRow`), and each
+  row is `[32B+64B hdr][left eye ew*2][right eye ew*2][junk]`. Decode at
+  `w*2` stride, skip 96B/row, take the left eye (640×400 for the
+  1748×408 mode). Decoding at the reported stride/width shears the image
+  diagonally. We use the left lens only (monocular PnP); stereo is a
+  possible future upgrade.
+- **HFOV** auto-selects by camera (OV580 = 85°); manual override in the
+  dialog.
+- **Pose solve.** With sparse near-coplanar front LEDs, monocular PnP
+  has a two-fold ambiguity → position jumps. The fix in place: lock
+  rotation to the IMU and solve translation only (damped Gauss-Newton),
+  falling back to free-rotation PnP when the IMU isn't streaming.
+- **Tracking diagnostics.** The worker logs `[psvr-cam] frames=… blobs=…
+  vis=… matched=… pnp=… reject=… ypr=[…] pos=[…]` to stderr (~1/s) plus
+  one-shot frame dumps for debugging. Run opentrack with stderr captured
+  (see opentrack-build skill) to see them. A dark room dramatically cuts
+  noise blobs.

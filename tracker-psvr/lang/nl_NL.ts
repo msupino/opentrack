@@ -27,6 +27,14 @@ Fix the issue, then press Re-calibrate below.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
+        <source>PSVR not detected on USB.
+• Check the cable from the helmet&apos;s processor unit to the Mac.
+• Make sure the processor unit is powered (its small LED is on).
+• Grant Input Monitoring permission to opentrack in System Settings &gt; Privacy &amp; Security.
+Fix the issue, then press Re-calibrate below.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
         <source>The PSVR headset appears to be OFF.
 Data is flowing from the USB processor unit, but the accelerometer is not measuring gravity — the headset itself is asleep.
 Press the power button on the in-line remote until the screen wakes, then press Re-calibrate.</source>
@@ -71,16 +79,59 @@ Calibration: after USB comes up (up to ~15 s on first start), the tracker waits 
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <source>Write diagnostic log to /tmp/psvr-diag.log (pose, gyro, accel, bias, sample rate; one row per second)</source>
+        <source>Mirror main display onto PSVR (side-by-side)</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <source>Enable camera-based position tracking [experimental]
-Uses the PSVR&apos;s built-in blue LEDs + a webcam to recover head X/Y/Z. First activation requests Camera permission. Blob detection runs on every frame; PnP solver lands in a follow-up commit, so today this only records diagnostic data.</source>
+        <source>Captures the main display and presents it as a stereoscopic side-by-side image on the PSVR screen. Requires Screen Recording permission.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <source>Mirror the main display side-by-side onto the PSVR screen (requires Screen Recording permission)</source>
+        <source>Write diagnostic log</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Writes one row per second to /tmp/psvr-diag.log: pose, gyro, accel, bias, sample rate. Useful for debugging tracking issues.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Enable camera-based position tracking [experimental]</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Uses the PSVR&apos;s built-in blue LEDs and a webcam to recover head X/Y/Z position. First activation requests Camera permission. Blob detection runs every frame; PnP solver lands in a follow-up commit, so today this only records diagnostic data.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Camera</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>(default camera)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source> (not connected)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Camera used for the LED-constellation tracker above. &quot;(default camera)&quot; picks whatever AVFoundation considers primary (usually the lid camera on MacBooks). A USB webcam or PS Camera generally tracks better.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Camera HFOV</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source> °</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Horizontal field of view of the camera selected above, in degrees. Used by the LED-constellation PnP solver to recover head distance correctly; a mismatched HFOV lands tracking at the wrong Z. Find this value on the camera&apos;s spec sheet, or experimentally tune until the on-screen tracking distance matches reality. Common values: 70 (typical lid webcam), 78 (FaceTime HD), 80 (UGREEN), 75 (PS Camera), 120 (GoPro).</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Auto (set HFOV by camera type)</source>
         <translation type="unfinished"></translation>
     </message>
 </context>

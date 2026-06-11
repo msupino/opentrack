@@ -26,6 +26,7 @@
 #include "options/tie.hpp"
 
 #include <cmath>
+#include <chrono>
 #include <cstdlib>      // setenv/unsetenv (constellation-log toggle bridge)
 #include <cstring>
 #include <QDebug>
@@ -95,6 +96,48 @@ double accel_roll_deg(const double a[3])
                    std::sqrt(a[PITCH_SRC]*a[PITCH_SRC] + a[YAW_SRC]*a[YAW_SRC]))
         * 180.0 / M_PI;
 }
+
+uint8_t control_report_unknown_byte(uint8_t cmd)
+{
+    // The reverse-engineered protocol docs describe this header byte as
+    // "unknown, 0 seems to always work". OpenHMD's raw hid_write packet
+    // uses 0x76 for 0x17, but macOS IOHIDDeviceSetReport rejects that
+    // variant on this device path, so keep the IOKit sender on 0.
+    (void)cmd;
+    return 0x00;
+}
+
+const uint8_t* keepalive_payload_for_cmd(uint8_t cmd,
+                                         uint8_t (&storage)[8],
+                                         size_t& len)
+{
+    len = 0;
+    switch (cmd) {
+    case 0x17: { // SetHeadsetPower(ON)
+        const uint8_t payload[4] = {0x01, 0x00, 0x00, 0x00};
+        std::memcpy(storage, payload, sizeof(payload));
+        len = sizeof(payload);
+        return storage;
+    }
+    case 0x11: { // EnableTracking(0xFFFFFF00)
+        const uint8_t payload[8] = {
+            0x00, 0xFF, 0xFF, 0xFF,
+            0x00, 0x00, 0x00, 0x00
+        };
+        std::memcpy(storage, payload, sizeof(payload));
+        len = sizeof(payload);
+        return storage;
+    }
+    case 0x23: { // SetVRMode(ON)
+        const uint8_t payload[4] = {0x01, 0x00, 0x00, 0x00};
+        std::memcpy(storage, payload, sizeof(payload));
+        len = sizeof(payload);
+        return storage;
+    }
+    default:
+        return nullptr;
+    }
+}
 }
 
 PSVRTracker::PSVRTracker() = default;
@@ -147,7 +190,6 @@ PSVRTracker::~PSVRTracker()
     if (calib_poll_timer_) { calib_poll_timer_->stop(); calib_poll_timer_->deleteLater(); calib_poll_timer_ = nullptr; }
     if (calib_label_)      { calib_label_->deleteLater(); calib_label_ = nullptr; }
     if (recal_button_)     { recal_button_->deleteLater(); recal_button_ = nullptr; }
-    if (keepalive_timer_)  { keepalive_timer_->stop(); keepalive_timer_->deleteLater(); keepalive_timer_ = nullptr; }
     if (diag_log_)         { std::fclose(diag_log_); diag_log_ = nullptr; }
 }
 
@@ -408,6 +450,9 @@ void PSVRTracker::show_recalibrate_button()
 module_status PSVRTracker::start_tracker(QFrame* frame)
 {
     stop_ = false;
+    camera_origin_valid_ = false;
+    camera_origin_reset_pending_ = true;
+    camera_origin_x_ = camera_origin_y_ = camera_origin_z_ = 0;
 
     // Remember the frame so Re-calibrate clicks can re-install the UI.
     tracker_frame_ = frame;
@@ -533,6 +578,26 @@ module_status PSVRTracker::start_tracker(QFrame* frame)
         }
     }
 
+    keepalive_enabled_ = static_cast<bool>(s_.keepalive_enable);
+    keepalive_interval_s_ = std::max(5, static_cast<int>(s_.keepalive_interval_s));
+    keepalive_cmd_ = 0x17;
+    keepalive_next_time_ = 0.0;
+    if (keepalive_enabled_) {
+        bool ok = false;
+        const int parsed = static_cast<QString>(s_.keepalive_cmd).toInt(&ok, 0);
+        if (ok) {
+            keepalive_cmd_ = static_cast<uint8_t>(parsed & 0xff);
+        } else {
+            qWarning().nospace()
+                << "PSVR: keepalive-cmd '" << static_cast<QString>(s_.keepalive_cmd)
+                << "' didn't parse as int; falling back to 0x17";
+        }
+        qDebug().nospace() << "PSVR: keepalive enabled - cmd 0x"
+                           << QString::number(keepalive_cmd_, 16)
+                           << " every " << keepalive_interval_s_
+                           << "s on HID worker";
+    }
+
     worker_ = std::thread([this]{ worker_loop(); });
     if (s_.enable_mirror)
         psvr_mirror_start();
@@ -590,49 +655,6 @@ module_status PSVRTracker::start_tracker(QFrame* frame)
     }
 #endif
 
-    // EXPERIMENTAL keepalive: spin up a periodic HID-command sender
-    // aimed at defeating the PSVR's 8-minute auto-sleep. Off by
-    // default; user opts in via [psvr-tracker] keepalive-enable=true
-    // in the ini. The byte sent and the interval are also ini-tweakable
-    // so we can iterate over the unexplored HID command space without
-    // rebuilding. Each fire is logged to the diag log so we can
-    // correlate with whether the headset stayed awake.
-    if (s_.keepalive_enable && tracker_frame_) {
-        const int interval_ms = std::max(5000, (int)s_.keepalive_interval_s * 1000);
-        // Parse keepalive-cmd with auto-base detection: accepts
-        // "0x1F" (hex), "31" (decimal), "0o37" (octal). Bad input
-        // falls through to 0x1F default - safer than zero, which
-        // would silently send a no-op every minute.
-        bool ok = false;
-        const int parsed = static_cast<QString>(s_.keepalive_cmd).toInt(&ok, 0);
-        const uint8_t cmd = ok ? (uint8_t)(parsed & 0xff) : 0x1F;
-        if (!ok) {
-            qWarning().nospace()
-                << "PSVR: keepalive-cmd '" << static_cast<QString>(s_.keepalive_cmd)
-                << "' didn't parse as int; falling back to 0x1F";
-        }
-        keepalive_timer_ = new QTimer(tracker_frame_);
-        keepalive_timer_->setInterval(interval_ms);
-        keepalive_timer_->setTimerType(Qt::CoarseTimer);  // sub-second
-                                                          // precision unnecessary
-        QObject::connect(keepalive_timer_, &QTimer::timeout, [this, cmd]() {
-            send_raw_to_all(cmd, nullptr, 0);
-            qDebug().nospace() << "PSVR: keepalive HID cmd 0x"
-                               << QString::number(cmd, 16) << " sent";
-            if (diag_log_) {
-                const double now = CFAbsoluteTimeGetCurrent();
-                std::fprintf(diag_log_,
-                    "%.3f\t%7.2f\tKEEPALIVE\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-"
-                    "\t-\t-\t-\t-\t-\t-\t-\t-\t0x%02x\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\n",
-                    now, now - diag_start_time_, (unsigned)cmd);
-                std::fflush(diag_log_);
-            }
-        });
-        keepalive_timer_->start();
-        qDebug().nospace() << "PSVR: keepalive enabled - cmd 0x"
-                           << QString::number(cmd, 16)
-                           << " every " << (interval_ms / 1000) << "s";
-    }
     return {};
 }
 
@@ -642,9 +664,11 @@ void PSVRTracker::data(double* data)
     //
     // Rotation always comes from the IMU. Position comes from the
     // camera constellation worker when it has a fresh PnP solution;
-    // when it doesn't (camera disabled, no LEDs in frame, PnP failed),
-    // we emit zeros so opentrack's Center command lands at the
-    // calibrated origin and no spurious translations get injected.
+    // when a solution first appears (or after Center), latch it as
+    // the local camera origin and publish deltas from there. This
+    // matters because IMU rotation becomes nonzero before camera PnP
+    // locks, so opentrack's startup auto-center can happen while XYZ
+    // is still unavailable.
     //
     // Fusion trackers can still run this plugin as the rotation source
     // and a different tracker as the position source; in that case the
@@ -658,11 +682,33 @@ void PSVRTracker::data(double* data)
         have_pos = camera_worker_->get_position(&x, &y, &z);
     }
 #endif
+    const double raw_x = x;
+    const double raw_y = y;
+    const double raw_z = z;
+    bool held_pos = false;
     camera_position_fresh_.store(have_pos, std::memory_order_relaxed);
     if (have_pos) {
+        if (!camera_origin_valid_ || camera_origin_reset_pending_) {
+            camera_origin_x_ = x;
+            camera_origin_y_ = y;
+            camera_origin_z_ = z;
+            camera_origin_valid_ = true;
+            camera_origin_reset_pending_ = false;
+        }
+        x -= camera_origin_x_;
+        y -= camera_origin_y_;
+        z -= camera_origin_z_;
         head_x_.store(x, std::memory_order_relaxed);
         head_y_.store(y, std::memory_order_relaxed);
         head_z_.store(z, std::memory_order_relaxed);
+    } else if (camera_origin_valid_) {
+        // Keep publishing the last accepted camera position while PnP
+        // reacquires. Returning zeros here makes opentrack look like XYZ
+        // is broken even though the camera had a valid lock moments ago.
+        x = head_x_.load(std::memory_order_relaxed);
+        y = head_y_.load(std::memory_order_relaxed);
+        z = head_z_.load(std::memory_order_relaxed);
+        held_pos = true;
     } else {
         x = y = z = 0;
     }
@@ -670,6 +716,31 @@ void PSVRTracker::data(double* data)
     data[3] = yaw_.load(std::memory_order_relaxed);
     data[4] = pitch_.load(std::memory_order_relaxed);
     data[5] = roll_.load(std::memory_order_relaxed);
+
+    using clock = std::chrono::steady_clock;
+    static auto last_xyz_log = clock::time_point{};
+    const auto now = clock::now();
+    if (now - last_xyz_log >= std::chrono::seconds(1)) {
+        last_xyz_log = now;
+        qDebug().nospace()
+            << "PSVR out: fresh=" << have_pos
+            << " held=" << held_pos
+            << " raw=[" << raw_x << ' ' << raw_y << ' ' << raw_z << ']'
+            << " origin_valid=" << camera_origin_valid_
+            << " origin=[" << camera_origin_x_ << ' ' << camera_origin_y_ << ' ' << camera_origin_z_ << ']'
+            << " out=[" << data[0] << ' ' << data[1] << ' ' << data[2] << ']'
+            << " ypr=[" << data[3] << ' ' << data[4] << ' ' << data[5] << ']';
+    }
+}
+
+bool PSVRTracker::center()
+{
+    camera_origin_valid_ = false;
+    camera_origin_reset_pending_ = true;
+    head_x_.store(0, std::memory_order_relaxed);
+    head_y_.store(0, std::memory_order_relaxed);
+    head_z_.store(0, std::memory_order_relaxed);
+    return false;
 }
 
 void PSVRTracker::process_group(const uint8_t* buf)
@@ -1125,7 +1196,7 @@ void PSVRTracker::send_activation(IOHIDDeviceRef device)
     auto send_cmd = [device](uint8_t cmd, const uint8_t* payload, size_t len) {
         uint8_t report[64]{};
         report[0] = cmd;
-        report[1] = 0x00;
+        report[1] = control_report_unknown_byte(cmd);
         report[2] = 0xAA;
         report[3] = static_cast<uint8_t>(len);
         if (payload && len > 0) std::memcpy(report + 4, payload, len);
@@ -1182,20 +1253,68 @@ void PSVRTracker::send_activation_to_all()
 }
 
 // Send a single HID output report to every matched device. Used for
-// courtesy commands like "set cinematic mode" on shutdown.
-void PSVRTracker::send_raw_to_all(uint8_t cmd,
-                                  const uint8_t* payload, size_t len)
+// courtesy commands like "set cinematic mode" on shutdown and for the
+// opt-in keepalive. Returns the number of devices that accepted the
+// report and logs failures so the sleep-debug trail has real evidence.
+int PSVRTracker::send_raw_to_all(uint8_t cmd,
+                                 const uint8_t* payload, size_t len)
 {
+    if (len > 60) {
+        qWarning().nospace()
+            << "PSVR: refusing HID cmd 0x" << QString::number(cmd, 16)
+            << " with oversized payload len " << len;
+        return 0;
+    }
+
     std::lock_guard<std::mutex> lk(devices_mu_);
     uint8_t report[64]{};
     report[0] = cmd;
-    report[1] = 0x00;
+    report[1] = control_report_unknown_byte(cmd);
     report[2] = 0xAA;
     report[3] = static_cast<uint8_t>(len);
     if (payload && len > 0) std::memcpy(report + 4, payload, len);
-    for (auto& md : devices_)
-        IOHIDDeviceSetReport(md.device, kIOHIDReportTypeOutput,
-                             cmd, report, 4 + len);
+    int ok_count = 0;
+    int fail_count = 0;
+    for (auto& md : devices_) {
+        IOReturn r = IOHIDDeviceSetReport(md.device, kIOHIDReportTypeOutput,
+                                          cmd, report, 4 + len);
+        if (r == kIOReturnSuccess) {
+            ++ok_count;
+        } else {
+            ++fail_count;
+            qWarning().nospace()
+                << "PSVR: HID cmd 0x" << QString::number(cmd, 16)
+                << " failed, IOReturn=0x" << QString::number(r, 16);
+        }
+    }
+    if (fail_count > 0) {
+        qWarning().nospace()
+            << "PSVR: HID cmd 0x" << QString::number(cmd, 16)
+            << " accepted by " << ok_count << " device(s), failed on "
+            << fail_count;
+    }
+    return ok_count;
+}
+
+void PSVRTracker::send_keepalive_to_all()
+{
+    uint8_t payload[8]{};
+    size_t len = 0;
+    const uint8_t* data =
+        keepalive_payload_for_cmd(keepalive_cmd_, payload, len);
+    const int ok_count = send_raw_to_all(keepalive_cmd_, data, len);
+    qDebug().nospace() << "PSVR: keepalive HID cmd 0x"
+                       << QString::number(keepalive_cmd_, 16)
+                       << " len " << len
+                       << " sent to " << ok_count << " device(s)";
+    if (diag_log_) {
+        const double now = CFAbsoluteTimeGetCurrent();
+        std::fprintf(diag_log_,
+            "%.3f\t%7.2f\tKEEPALIVE\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-"
+            "\t-\t-\t-\t-\t-\t-\t-\t-\t0x%02x\t%zu\t%d\t-\t-\t-\t-\t-\t-\t-\n",
+            now, now - diag_start_time_, (unsigned)keepalive_cmd_, len, ok_count);
+        std::fflush(diag_log_);
+    }
 }
 
 // Put the headset into cinematic (single-screen) display mode. Called
@@ -1293,7 +1412,18 @@ void PSVRTracker::worker_loop()
                    << ") - grant Input Monitoring permission to opentrack in System Settings";
     }
 
-    // Keepalive strategy: on-stall recovery rather than a blind timer.
+    // Keepalive strategy: an opt-in, lightweight pre-sleep heartbeat plus
+    // on-stall recovery. The heartbeat is sent from this HID worker loop
+    // rather than from a GUI QTimer, so it keeps its cadence even when
+    // macOS backgrounds/throttles the opentrack UI.
+    //
+    // With keepalive-cmd=0x17 we send just SetHeadsetPower(ON), matching
+    // OpenHMD's known-good packet shape. That is intentionally lighter
+    // than the full activation burst below. If the firmware still goes
+    // silent, the existing watchdog re-fires the full burst after
+    // STALL_RECOVERY_SEC.
+    //
+    // Historical note:
     //
     // The old periodic-keepalive design fired the activation burst
     // (0x17 SetHeadsetPower + 0x11 EnableTracking) every 10 s, but the
@@ -1304,7 +1434,7 @@ void PSVRTracker::worker_loop()
     // keepalive that doesn't reboot the sensor chain — 0x17, 0x11, and
     // 0x23 all stall the stream.
     //
-    // Instead, we watch `last_report_time_` (stamped in report_cb). If
+    // For recovery, we watch `last_report_time_` (stamped in report_cb). If
     // it stops advancing for STALL_RECOVERY_SEC while calibration is
     // complete, the PSVR has likely auto-slept (the headset's ~8 min
     // inactivity sleep is the common trigger). We then fire the
@@ -1313,9 +1443,18 @@ void PSVRTracker::worker_loop()
     // was silent for at least 5 s before we noticed.
 
     worker_start_time_ = CFAbsoluteTimeGetCurrent();
+    keepalive_next_time_ = keepalive_enabled_
+        ? worker_start_time_ + keepalive_interval_s_
+        : 0.0;
 
     while (!stop_) {
         CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.1, true);
+        const double now = CFAbsoluteTimeGetCurrent();
+
+        if (keepalive_enabled_ && now >= keepalive_next_time_) {
+            send_keepalive_to_all();
+            keepalive_next_time_ = now + keepalive_interval_s_;
+        }
 
         // Silent-stream detection. Two cases this needs to catch:
         //   (a) Cold start: no HID reports ever arrive in the first
@@ -1347,7 +1486,7 @@ void PSVRTracker::worker_loop()
             const double ref = (last_report_time_ > 0.0)
                                    ? last_report_time_
                                    : worker_start_time_;
-            const double elapsed = CFAbsoluteTimeGetCurrent() - ref;
+            const double elapsed = now - ref;
 
             // Fast-fail "not on USB" path. IOHIDManager's matching
             // scan completes within a few ms of Open; if devices_ is
@@ -1416,7 +1555,7 @@ void PSVRTracker::worker_loop()
         if (calibrated_.load(std::memory_order_relaxed)
             && last_report_time_ > 0.0)
         {
-            const double idle = CFAbsoluteTimeGetCurrent() - last_report_time_;
+            const double idle = now - last_report_time_;
             if (idle > STALL_RECOVERY_SEC) {
                 qWarning().nospace()
                     << "PSVR: HID stream silent for " << idle

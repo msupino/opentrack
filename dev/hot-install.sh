@@ -36,6 +36,7 @@
 #   dev/hot-install.sh tracker-psvr proto-wine  # specific targets
 #   dev/hot-install.sh --exe [targets...]       # also rebuild + reinstall
 #                                               # the main opentrack binary
+#                                               # and core logic dylib
 #   dev/hot-install.sh --no-launch              # skip the final `open`
 #   dev/hot-install.sh -h | --help              # show this header
 
@@ -58,10 +59,14 @@ else
 fi
 
 BUNDLE="$REPO/install/opentrack.app"
+BUNDLE_FRAMEWORKS="$BUNDLE/Contents/Frameworks"
 BUNDLE_PLUGINS="$BUNDLE/Contents/MacOS/Plugins"
 STANDALONE_PLUGINS="$REPO/install/Plugins"
+STANDALONE_LIBS="$REPO/install/Library"
 EXE_IN_BUNDLE="$BUNDLE/Contents/MacOS/opentrack"
 BUILT_EXE="$BUILD/opentrack/opentrack.app/Contents/MacOS/opentrack"
+LOGIC_IN_BUNDLE="$BUNDLE_FRAMEWORKS/opentrack-logic.dylib"
+BUILT_LOGIC="$BUILD/logic/opentrack-logic.dylib"
 
 [[ "$(uname -s)" == "Darwin" ]] || { echo "macOS only" >&2; exit 2; }
 [[ -d "$BUNDLE" ]] || { echo "no .app at $BUNDLE — run \`make install\` once first" >&2; exit 2; }
@@ -132,7 +137,7 @@ fix_install_names() {
     while read -r path; do
         local base
         base="$(basename "$path")"
-        if [[ -f "$BUNDLE/Contents/Frameworks/$base" ]]; then
+        if [[ -f "$BUNDLE_FRAMEWORKS/$base" ]]; then
             install_name_tool -change "$path" \
                 "@executable_path/../Frameworks/$base" \
                 "$dylib" 2>/dev/null || true
@@ -174,6 +179,16 @@ done
 
 # --- optional main-exe pass -----------------------------------------------
 if [[ $REBUILD_EXE -eq 1 ]]; then
+    echo "[hot-install] building opentrack-logic"
+    make -j8 opentrack-logic >/dev/null
+    echo "[hot-install] installing logic dylib"
+    cp -f "$BUILT_LOGIC" "$LOGIC_IN_BUNDLE"
+    cp -f "$BUILT_LOGIC" "$STANDALONE_LIBS/opentrack-logic.dylib" 2>/dev/null || true
+    fix_install_names "$LOGIC_IN_BUNDLE"
+    strip_bad_rpaths  "$LOGIC_IN_BUNDLE"
+    install_name_tool -add_rpath '@loader_path' \
+        "$LOGIC_IN_BUNDLE" 2>/dev/null || true
+
     echo "[hot-install] building opentrack-executable"
     make -j8 opentrack-executable >/dev/null
     echo "[hot-install] installing main exe"
@@ -242,6 +257,8 @@ for m in "${MODULES[@]}"; do
     codesign --force -s "$SIGN_ID" "$plug" 2>&1 | tail -1
 done
 if [[ $REBUILD_EXE -eq 1 ]]; then
+    echo "[hot-install] re-sign logic dylib with identity '$SIGN_ID'"
+    codesign --force -s "$SIGN_ID" "$LOGIC_IN_BUNDLE" 2>&1 | tail -1
     echo "[hot-install] re-sign main exe with identity '$SIGN_ID'"
     codesign --force -s "$SIGN_ID" "$EXE_IN_BUNDLE" 2>&1 | tail -1
 fi

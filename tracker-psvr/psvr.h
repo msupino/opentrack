@@ -48,20 +48,17 @@ struct psvr_settings : opts {
     value<bool> enable_camera;
     // EXPERIMENTAL: send a periodic HID command to the PSVR to defeat
     // its built-in 8-minute auto-sleep. The command byte and interval
-    // are both ini-tweakable so we can iterate over the unexplored
-    // command space (PSVRFramework documented 0x11 / 0x17 / 0x21 /
-    // 0x23, but PS4 firmware sends 0x1A and 0x1F too, with unknown
-    // semantics) without rebuilding. Default OFF because the wrong
-    // command byte may disrupt the IMU stream the way periodic
-    // re-activation did when we tried it earlier; users opt in to
-    // iterate.
+    // are both ini-tweakable so we can iterate without rebuilding.
+    // Default OFF because the wrong command byte may disrupt the IMU
+    // stream the way periodic re-activation did when we tried it
+    // earlier; users opt in to iterate.
     //
-    // To use: set keepalive-enable=true, leave keepalive-cmd at 0x1F
-    // for first probe, watch /tmp/psvr-diag.log for the first 12 min.
-    // If the headset stays awake AND IMU rate stays ~200 Hz, the byte
-    // works. If IMU rate drops to 0 or jitters, change keepalive-cmd
-    // to 0x1A and try again. Reasonable values to try in order:
-    //   0x1F, 0x1A, 0x40, 0xA0, 0x15
+    // To use: set keepalive-enable=true, leave keepalive-cmd at 0x17
+    // for the first probe, watch /tmp/psvr-diag.log for the first
+    // 12 min. If the headset stays awake AND IMU rate stays ~200 Hz,
+    // the byte works. If IMU rate drops to 0 or jitters, try 0x1F or
+    // 0x1A next. 0x17 uses the documented SetHeadsetPower(ON) payload;
+    // 0x11 and 0x23 also get their known payloads.
     //
     // keepalive_cmd is a QString rather than int so the ini can use
     // hex notation ("0x1F") which is the natural representation for
@@ -105,7 +102,7 @@ struct psvr_settings : opts {
         enable_diag_log(b, "enable-diag-log", false),
         enable_camera(b, "enable-camera", false),
         keepalive_enable(b, "keepalive-enable", false),
-        keepalive_cmd(b, "keepalive-cmd", QStringLiteral("0x1F")),
+        keepalive_cmd(b, "keepalive-cmd", QStringLiteral("0x17")),
         keepalive_interval_s(b, "keepalive-interval-s", 60),
         camera_name(b, "camera-name", {}),
         camera_hfov_deg(b, "camera-hfov-deg", 70.0),
@@ -121,6 +118,7 @@ public:
 
     module_status start_tracker(QFrame*) override;
     void data(double* data) override;
+    bool center() override;
 
 private:
     std::atomic<double> yaw_{0}, pitch_{0}, roll_{0};
@@ -466,6 +464,13 @@ private:
     // fresh solution, these stay at 0 (or the last good value); data()
     // reads them via std::memory_order_relaxed.
     std::atomic<double> head_x_{0}, head_y_{0}, head_z_{0};
+    // Camera PnP produces absolute camera-frame coordinates. opentrack's
+    // auto-center can happen before the first camera lock because IMU
+    // rotation starts publishing earlier, so keep a tracker-local origin
+    // for XYZ and publish camera deltas from that origin.
+    bool camera_origin_valid_{false};
+    bool camera_origin_reset_pending_{true};
+    double camera_origin_x_{0}, camera_origin_y_{0}, camera_origin_z_{0};
     // Set by data() consumers so diag logging can tell which fields
     // are actually going out to opentrack. Redundant with
     // camera_worker_->is_running() when enabled; kept for log clarity
@@ -483,21 +488,21 @@ private:
     QTimer*              camera_preview_timer_{nullptr};
     std::vector<uint8_t> camera_preview_buf_;
 
-    // EXPERIMENTAL: periodic HID keepalive timer aimed at defeating
-    // the PSVR's 8-minute auto-sleep. Only created when settings.
-    // keepalive_enable is true. Owned by tracker_frame_ so Qt's
-    // parent chain cleans it up. The timer fires send_raw_to_all
-    // with the user-configured command byte (default 0x1F) and an
-    // empty payload; we log each fire to diag_log_ so the post-mortem
-    // shows whether the keepalive correlated with the headset
-    // staying awake or not.
-    QTimer* keepalive_timer_{nullptr};
+    // EXPERIMENTAL: periodic HID keepalive aimed at defeating the
+    // PSVR's 8-minute auto-sleep. Scheduled from worker_loop on the
+    // IOHID CFRunLoop thread instead of a GUI QTimer so macOS App Nap
+    // or backgrounded UI timer throttling cannot skip the heartbeat.
+    bool    keepalive_enabled_{false};
+    uint8_t keepalive_cmd_{0x17};
+    int     keepalive_interval_s_{60};
+    double  keepalive_next_time_{0.0};
 
     void worker_loop();
     void send_activation(IOHIDDeviceRef device);
     void send_activation_to_all();           // iterates devices_ under the lock
     void send_cinematic_mode_to_all();       // 0x23 VRMode(OFF) to all devices
-    void send_raw_to_all(uint8_t cmd, const uint8_t* payload, size_t len);
+    int  send_raw_to_all(uint8_t cmd, const uint8_t* payload, size_t len);
+    void send_keepalive_to_all();
 
     static void report_cb(void* context, IOReturn result, void* sender,
                           IOHIDReportType type, uint32_t reportID,

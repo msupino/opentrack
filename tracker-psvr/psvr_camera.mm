@@ -72,7 +72,9 @@
 #include <atomic>
 #include <mutex>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <algorithm>
 #include <cctype>
@@ -101,18 +103,81 @@ double recommended_hfov_for_camera(const std::string& localized_name) {
     return 70.0;                          // generic webcam default
 }
 
-// Freshness window for publish/consume. Camera runs at ~30 Hz; we allow
-// up to ~15 frames (~500 ms) of staleness before the reader treats the
-// position as "unknown" and falls back to its default (usually zero).
-// Tuned to match the "degrades gracefully to IMU-only within ~500 ms"
-// behavior the plugin's docs promise: short enough that a real loss
-// of tracking (helmet leaves the frame) is reflected promptly, long
-// enough that a few consecutive failed PnP frames (one blink-like
-// LED dropout, a moving lamp briefly confusing the matcher) don't
-// visibly snap the user's position to zero. The previous 200 ms
-// window was tight enough that any minor hiccup cleared position;
-// users perceived that as "position tracking doesn't do anything".
-static constexpr double RESULT_STALE_SEC = 0.5;
+static bool contains_ci(std::string n, const char* needle)
+{
+    std::transform(n.begin(), n.end(), n.begin(),
+                   [](unsigned char c){ return (char)std::tolower(c); });
+    std::string s(needle);
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c){ return (char)std::tolower(c); });
+    return n.find(s) != std::string::npos;
+}
+
+static bool is_ov580_camera(const std::string& localized_name)
+{
+    return contains_ci(localized_name, "ov580") ||
+           contains_ci(localized_name, "playstation");
+}
+
+static bool ov580_eye_dims_for_raw(int rw, int& ew, int& ih)
+{
+    if (rw == 3448) { ew = 1280; ih = 800; return true; }
+    if (rw == 1748) { ew =  640; ih = 400; return true; }
+    if (rw ==  898) { ew =  320; ih = 200; return true; }
+    return false;
+}
+
+static double max_fps_for_format(AVCaptureDeviceFormat* fmt)
+{
+    double best = 0.0;
+    for (AVFrameRateRange* range in fmt.videoSupportedFrameRateRanges)
+        best = std::max(best, range.maxFrameRate);
+    return best;
+}
+
+static bool format_supports_fps(AVCaptureDeviceFormat* fmt, double fps)
+{
+    for (AVFrameRateRange* range in fmt.videoSupportedFrameRateRanges) {
+        if (range.minFrameRate <= fps + 0.01 &&
+            range.maxFrameRate + 0.01 >= fps) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool frame_duration_for_fps(AVCaptureDeviceFormat* fmt,
+                                   double fps,
+                                   CMTime* duration)
+{
+    AVFrameRateRange* best = nil;
+    double best_delta = std::numeric_limits<double>::infinity();
+    for (AVFrameRateRange* range in fmt.videoSupportedFrameRateRanges) {
+        if (range.minFrameRate <= fps + 0.01 &&
+            range.maxFrameRate + 0.01 >= fps) {
+            const double delta = std::abs(range.maxFrameRate - fps);
+            if (delta < best_delta) {
+                best = range;
+                best_delta = delta;
+            }
+        }
+    }
+    if (!best)
+        return false;
+    // Use the exact UVC duration advertised by AVFoundation. Some
+    // devices print "60.00 fps" but reject a synthesized 1/60 CMTime.
+    *duration = best.minFrameDuration;
+    return true;
+}
+
+// Freshness window for publish/consume. Camera runs at ~30 Hz, but the
+// current PSVR constellation solver can accept only every ~1 s while
+// the matcher is being tuned. Hold the last accepted pose long enough
+// to bridge those reject bursts instead of snapping opentrack XYZ back
+// to zero between good camera locks. Still short enough that a real
+// loss of tracking (helmet leaves the frame) falls back to IMU-only
+// promptly.
+static constexpr double RESULT_STALE_SEC = 2.0;
 
 // Periodic [psvr-cam] stderr summary cadence (frames). At ~30 Hz this
 // emits one line per second - low enough to read at a glance without
@@ -122,22 +187,46 @@ static constexpr double RESULT_STALE_SEC = 0.5;
 // enabling the verbose constellation log file.
 static constexpr int PSVR_CAM_LOG_INTERVAL_FRAMES = 30;
 
+static bool frame_dumps_enabled()
+{
+    static const bool enabled = [] {
+        const char* v = std::getenv("PSVR_CAM_DUMP_FRAMES");
+        return v && *v && !(v[0] == '0' && v[1] == '\0');
+    }();
+    return enabled;
+}
+
+static double requested_ov580_fps()
+{
+    static const double fps = [] {
+        const char* v = std::getenv("PSVR_CAM_FPS");
+        if (!v || !*v)
+            return 0.0;
+        char* end = nullptr;
+        const double parsed = std::strtod(v, &end);
+        return (end != v && parsed >= 1.0) ? parsed : 0.0;
+    }();
+    return fps;
+}
+
 // Minimum / maximum blob area in pixels for the extractor. The PSVR
 // LEDs at ~60-100 cm from a 720p camera at ~70deg HFOV render as
-// roughly 3-25 px diameter (5-500 px^2). The lower bound rejects
+// roughly 3-25 px diameter, except the front-center visor LED which
+// saturates into a wide bar on the OV580. The lower bound rejects
 // single-pixel speckle and the morphological-opening leftovers that
 // would otherwise inflate the candidate set into the 20+ range; the
 // upper bound rejects bright spread-out areas like a ceiling lamp or
-// a window in frame. 5 px^2 is small enough to keep a 2-3 px LED at
-// ~150 cm range while still dropping the salt-and-pepper noise that
-// every webcam produces after grayscale thresholding.
+// a window in frame while keeping that center bar. 5 px^2 is small
+// enough to keep a 2-3 px LED at ~150 cm range while still dropping
+// the salt-and-pepper noise that every webcam produces after grayscale
+// thresholding.
 // DIAGNOSTIC v2: dropped all the way to 1.0 to admit even single-pixel
 // LED dots. With area=1 plus circularity disabled below, virtually any
 // bright pixel cluster passes. Matcher's RANSAC + facing-camera filter
 // will discriminate real LEDs from noise. Tighten back toward 3-5
 // once we know blobs are reaching the matcher.
 static constexpr double BLOB_MIN_AREA_PX = 1.0;
-static constexpr double BLOB_MAX_AREA_PX = 500.0;
+static constexpr double BLOB_MAX_AREA_PX = 1500.0;
 
 // Minimum 4*PI*A/P^2 circularity. A geometric circle is 1.0; a real
 // PSVR LED (with a tiny bit of motion blur / partial saturation tail)
@@ -431,7 +520,6 @@ bool Worker::get_position(double* x, double* y, double* z) const {
         const double  x_v    = impl_->pos_x_cm;
         const double  y_v    = impl_->pos_y_cm;
         const double  z_v    = impl_->pos_z_cm;
-        const bool    ok     = impl_->pnp_ok_latest;
         const uint64_t s2 = impl_->pos_seq.load(std::memory_order_acquire);
         if (s1 != s2) continue;         // writer ran during our read
         if (epoch == 0.0) return false;
@@ -439,7 +527,7 @@ bool Worker::get_position(double* x, double* y, double* z) const {
         *x = x_v;
         *y = y_v;
         *z = z_v;
-        return ok;
+        return true;
     }
     return false;
 }
@@ -639,32 +727,49 @@ bool Worker::start() {
         [session addInput:input];
 
         // Picky-camera activeFormat selection. The OV580 (PS4 Camera)
-        // advertises 1748x408, 896x500, 640x400, and 320x192. The
-        // higher-res modes pack both lenses into one frame with row
-        // padding that breaks the YUYV decoder; force the camera to
-        // the smallest single-lens mode (640x400) where the data is
-        // a clean BGR-able scanline. Generic webcams (UGREEN, FaceTime,
-        // etc.) are left at whatever the sessionPreset negotiated -
-        // they don't have this problem.
+        // reports raw stereo container widths (898/1748/3448); the
+        // decoder below extracts the left-eye image from those as
+        // 320x200 / 640x400 / 1280x800. Prefer the 640x400 eye mode.
+        // A higher OV580 frame rate can be forced for experiments by
+        // launching with PSVR_CAM_FPS=60, but the default leaves frame
+        // duration negotiation to AVFoundation because some adapters
+        // stall after a few frames when hard-pinned.
         //
         // We pick by (a) sensible dimensions for tracking (target
         // 640 wide, prefer <= 1280) and (b) avoiding tile-packed
         // modes (height < 200 is a give-away that the format is
         // sub-lens / non-image).
         {
+            const char* dev_name_utf8 = dev.localizedName.UTF8String;
+            const std::string dev_name = dev_name_utf8 ? dev_name_utf8 : "";
+            const bool ov580 = is_ov580_camera(dev_name);
+            const double target_fps = ov580 ? requested_ov580_fps() : 0.0;
             AVCaptureDeviceFormat* best = nil;
             int                    best_score = -1;
             for (AVCaptureDeviceFormat* fmt in dev.formats) {
                 CMVideoDimensions dim =
                     CMVideoFormatDescriptionGetDimensions(fmt.formatDescription);
-                if (dim.height < 200) continue;  // skip sub-lens / weird
-                if (dim.width > 1280) continue;  // skip wide stereo packs
-                // Prefer 640x400 (the OV580 single-lens sweet spot),
-                // otherwise score closer-to-target higher.
-                const int target_w = 640, target_h = 400;
-                int score = 10000
+                int score = -1;
+                if (ov580) {
+                    int eye_w = 0, eye_h = 0;
+                    if (!ov580_eye_dims_for_raw(dim.width, eye_w, eye_h))
+                        continue;
+                    if (target_fps > 0.0 &&
+                        !format_supports_fps(fmt, target_fps))
+                        continue;
+                    const int target_w = 640, target_h = 400;
+                    score = 100000
+                            - std::abs(eye_w - target_w) * 10
+                            - std::abs(eye_h - target_h) * 10
+                            + (int)std::round(max_fps_for_format(fmt));
+                } else {
+                    if (dim.height < 200) continue;  // skip sub-lens / weird
+                    if (dim.width > 1280) continue;  // skip wide stereo packs
+                    const int target_w = 640, target_h = 400;
+                    score = 10000
                             - std::abs(dim.width  - target_w)
                             - std::abs(dim.height - target_h);
+                }
                 if (score > best_score) {
                     best_score = score;
                     best       = fmt;
@@ -672,6 +777,14 @@ bool Worker::start() {
             }
             if (best && [dev lockForConfiguration:nil]) {
                 dev.activeFormat = best;
+                if (target_fps > 0.0) {
+                    CMTime frame_duration = kCMTimeInvalid;
+                    if (frame_duration_for_fps(best, target_fps,
+                                               &frame_duration)) {
+                        dev.activeVideoMinFrameDuration = frame_duration;
+                        dev.activeVideoMaxFrameDuration = frame_duration;
+                    }
+                }
                 [dev unlockForConfiguration];
             }
         }
@@ -688,8 +801,12 @@ bool Worker::start() {
                 (char)((codec >> 24) & 0xff), (char)((codec >> 16) & 0xff),
                 (char)((codec >> 8) & 0xff),  (char)(codec & 0xff), 0};
             std::fprintf(stderr,
-                "[psvr-cam] active format: %dx%d fourcc='%s'\n",
-                dim.width, dim.height, c);
+                "[psvr-cam] active format: %dx%d fourcc='%s' target_fps=%.1f\n",
+                dim.width, dim.height, c,
+                dev.activeVideoMinFrameDuration.timescale > 0
+                    ? (double)dev.activeVideoMinFrameDuration.timescale /
+                      (double)dev.activeVideoMinFrameDuration.value
+                    : 0.0);
         }
 
         AVCaptureVideoDataOutput* output = [[AVCaptureVideoDataOutput alloc] init];
@@ -803,14 +920,8 @@ static void process_frame(Worker::Impl* s, CVPixelBufferRef buf) {
     //         898              320              200
     //
     // (YUYV, not UYVY, confirmed: COLOR_YUV2BGR_UYVY gave magenta/green.)
-    auto ov580_dims = [](int rw, int& ew, int& ih) -> bool {
-        if (rw == 3448) { ew = 1280; ih = 800; return true; }
-        if (rw == 1748) { ew =  640; ih = 400; return true; }
-        if (rw ==  898) { ew =  320; ih = 200; return true; }
-        return false;
-    };
     int eye_w = 0, eye_h = 0;
-    if (ov580_dims(w, eye_w, eye_h)) {
+    if (ov580_eye_dims_for_raw(w, eye_w, eye_h)) {
         static bool announced = false;
         if (!announced) {
             std::fprintf(stderr,
@@ -849,6 +960,23 @@ static void process_frame(Worker::Impl* s, CVPixelBufferRef buf) {
     }
 
     CVPixelBufferUnlockBaseAddress(buf, kCVPixelBufferLock_ReadOnly);
+
+    // Optional diagnostic dump of the clean de-interleaved frame. Keep
+    // this out of the default capture path; disk I/O from the camera
+    // callback adds avoidable jitter when testing tracking latency.
+    if (frame_dumps_enabled()) {
+        static int dump_skip = 0;
+        if ((dump_skip++ % 150) == 0) {
+            cv::Mat g;
+            cv::cvtColor(s->bgr_owned, g, cv::COLOR_BGR2GRAY);
+            if (FILE* f = std::fopen("/tmp/psvr-frame.pgm", "wb")) {
+                std::fprintf(f, "P5\n%d %d\n255\n", g.cols, g.rows);
+                for (int y = 0; y < g.rows; ++y)
+                    std::fwrite(g.ptr(y), 1, g.cols, f);
+                std::fclose(f);
+            }
+        }
+    }
 
     // Grayscale brightness gate. Was an HSV-blue + white-saturated
     // double mask; replaced with a single grayscale threshold because
@@ -1049,6 +1177,7 @@ static void process_frame(Worker::Impl* s, CVPixelBufferRef buf) {
     // block so the overlay can show "pnp_ok: N / M" correctly without
     // a one-frame lag.
     uint64_t frames_after = 0, blob_after = 0, pnp_after = 0;
+    double last_x_after = 0, last_y_after = 0, last_z_after = 0;
     {
         std::lock_guard<std::mutex> lk(s->diag_mu);
         s->diag.frames_captured++;
@@ -1068,6 +1197,9 @@ static void process_frame(Worker::Impl* s, CVPixelBufferRef buf) {
         frames_after = s->diag.frames_captured;
         blob_after   = s->diag.frames_with_any_blob;
         pnp_after    = s->diag.pnp_ok_count;
+        last_x_after = s->diag.last_x_cm;
+        last_y_after = s->diag.last_y_cm;
+        last_z_after = s->diag.last_z_cm;
     }
 
     // Build the annotated preview frame. `vis` was already populated
@@ -1243,6 +1375,25 @@ static void process_frame(Worker::Impl* s, CVPixelBufferRef buf) {
             }
         }
 
+        if (frame_dumps_enabled()) {
+            static int preview_dump_skip = 0;
+            if ((preview_dump_skip++ % 30) == 0) {
+                if (FILE* f = std::fopen("/tmp/psvr-preview.ppm", "wb")) {
+                    std::fprintf(f, "P6\n%d %d\n255\n", vis.cols, vis.rows);
+                    for (int y = 0; y < vis.rows; ++y) {
+                        const cv::Vec3b* row = vis.ptr<cv::Vec3b>(y);
+                        for (int x = 0; x < vis.cols; ++x) {
+                            const unsigned char rgb[3] = {
+                                row[x][2], row[x][1], row[x][0]
+                            };
+                            std::fwrite(rgb, 1, sizeof rgb, f);
+                        }
+                    }
+                    std::fclose(f);
+                }
+            }
+        }
+
         std::lock_guard<std::mutex> lk(s->preview_mu);
         s->preview_bgr = std::move(vis);
     }
@@ -1276,9 +1427,7 @@ static void process_frame(Worker::Impl* s, CVPixelBufferRef buf) {
             r.ok ? "OK" : "--",
             r.reject_reason,
             y_deg, p_deg, r_deg,
-            r.ok ? r.x_cm : 0.0,
-            r.ok ? r.y_cm : 0.0,
-            r.ok ? r.z_cm : 0.0);
+            last_x_after, last_y_after, last_z_after);
     }
 }
 

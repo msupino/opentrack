@@ -11,31 +11,28 @@
  *      pinhole model (no distortion). A Zhang-style calibration would
  *      get us sub-pixel accuracy but is out of scope - the downstream
  *      opentrack curves smooth anything left over.
- *   3. Project the 9 canonical LED positions through the IMU rotation
- *      prior at the guessed translation to get their expected image-
- *      space locations. LEDs that land behind the camera or outside
- *      the frame get dropped (they can't be matched).
+ *   3. Project the 9 canonical LED positions through the last accepted
+ *      camera pose when available, or through a rough IMU/default
+ *      rotation at cold start, to get their expected image-space
+ *      locations. LEDs that land behind the camera or outside the
+ *      frame get dropped (they can't be matched).
  *   4. Greedy nearest-neighbor assignment from projected LEDs to the
  *      observed blobs, rejecting matches beyond MAX_MATCH_DIST_PX.
  *      Each blob can be used at most once. O(NUM_LEDS * blobs) is fine
  *      for 9 * ~20.
  *   5. With the best blob<->LED correspondence set, do the FINAL pose
- *      solve. When the IMU rotation is trustworthy (the normal case
- *      once the helmet streams) we FIX rotation to the IMU's
- *      head_to_camera_rotation() and solve ONLY the 3-DOF translation
- *      by damped Gauss-Newton. This removes the planar-PnP two-fold
- *      rotational ambiguity that otherwise makes the pose flip between
- *      two interpretations frame to frame (the alternating pnp=OK /
- *      reject=JUMP symptom on the ~5 near-coplanar front LEDs). If the
- *      IMU isn't streaming yet (all-zero attitude AND no prior) we fall
- *      back to a free-rotation cv::solvePnPRansac refine so camera-only
- *      bring-up still works.
+ *      solve as a camera-pose solve using cv::solvePnPRansac. The
+ *      resulting rvec is an internal camera-tracking prior only; the
+ *      user-visible yaw/pitch/roll still come from the PSVR IMU in
+ *      psvr.cpp. Keeping the camera pose independent lets XYZ update
+ *      continuously even when the IMU attitude convention doesn't line
+ *      up perfectly with the optical model.
  *   6. Compute reprojection RMS; reject if > MAX_REPROJECTION_RMS_PX.
  *      Also reject if the translation jumps more than MAX_CM_PER_FRAME
  *      from the previous accepted result - guards against a blob burst
  *      from a lamp bouncing the matcher to a local-minimum pose. With
- *      rotation locked to the IMU this gate fires far less because the
- *      rotation can no longer flip between the two planar solutions.
+ *      camera-pose prior this gate is mainly a guardrail against false
+ *      blob correspondences.
  *   7. On accept, update cached (rvec, tvec, timestamp) for next
  *      frame, and return x_cm/y_cm/z_cm in the Worker's convention
  *      (+X right, +Y up, -Z forward) which inverts OpenCV's +Y-down
@@ -64,12 +61,11 @@
  * ---------------------------------------
  * The canonical problem - 9 near-identical blobs, several self-
  * occluded at any angle - normally requires an expensive search. We
- * dodge that entirely because we HAVE a rotation prior from the IMU
- * and a translation prior from the previous frame (or a
- * "user-at-arm-length" default for cold start). Those two priors are
- * usually good enough that greedy NN matching just works, and when it
- * doesn't the jump gate rejects the frame so we don't latch a bad
- * pose. This is the approach PSMoveService/MorpheusHMD uses.
+ * dodge that mostly by carrying the previous accepted camera pose
+ * forward as a prior (or using a "user-at-arm-length" default for cold
+ * start). That prior is usually good enough that the sampled
+ * correspondence search converges, and when it doesn't the jump/RMS
+ * gates reject the frame so we don't latch a bad pose.
  */
 #include "psvr_constellation.h"
 
@@ -168,6 +164,10 @@ struct SolverState::Impl {
     cv::Vec3d  state_tvec{0, 0, 60.0};   // kDefaultUserZCm; literal here
                                          //   because constants live below
     double     state_epoch_sec = 0.0;
+    bool       tentative_valid = false;
+    cv::Vec3d  tentative_tvec{0, 0, 60.0};
+    int        tentative_hits = 0;
+    double     tentative_epoch_sec = 0.0;
 
     std::mutex log_mu;
     FILE*      log_fp           = nullptr;
@@ -196,6 +196,7 @@ namespace {
 // surfaces in builds that only exercise the explicit-HFOV path.
 [[maybe_unused]] constexpr double kDefaultHFOVDeg        = 70.0; // typical laptop webcam
 constexpr double kMaxMatchDistPx        = 250.0;// projected-LED to blob
+constexpr double kPriorMatchDistPx      = 40.0; // locked prior projection to blob
 // Inlier RMS threshold is set loose (30 px @ 1920x1080) because the
 // LED constellation model is "eyeballed" from PSMoveService (~5 mm
 // accuracy per LED) and the 70-deg HFOV intrinsic is approximate -
@@ -226,6 +227,15 @@ constexpr double kPermSearchInlierPx    = 15.0;
 // and the lock stabilises on whichever assignment is geometrically
 // correct.
 constexpr double kMaxCmPerFrame         = 3.0;
+// The camera-pose rvec is only an internal optical matching prior;
+// user-visible yaw/pitch/roll still come from the PSVR IMU. With the
+// near-planar five-front-LED view, free PnP can find mirror-rotation
+// twins whose translation is close enough to pass the cm jump gate but
+// whose projected LED layout flips across the image. Rejecting large
+// per-frame camera-rvec changes keeps the matcher on one optical
+// branch while still allowing very fast real head motion (20 deg at
+// 30 Hz = 600 deg/s).
+constexpr double kMaxCameraRotDegPerFrame = 20.0;
 // Minimum inliers for an already-locked track to continue. PSVR has
 // 9 LEDs; 4 is the AP3P minimum + 1 disambiguator. Used when we
 // have a fresh prior (i.e. continuing an existing lock); the
@@ -244,7 +254,11 @@ constexpr int    kMinInliers            = 4;
 // failure mode (4 inliers would let it through; we keep 5 as a safety
 // margin) without being unreachable in practice.
 constexpr int    kStrongLockMinInliers  = 5;
-constexpr double kStalenessResetSec     = 1.0;  // prior expires after
+constexpr double kFirstLock4LedMaxRMSPx = 16.0;
+constexpr double kFirstLock4LedMaxCm    = 4.0;
+constexpr int    kFirstLock4LedHits     = 3;
+constexpr double kFirstLockTentativeSec = 0.75;
+constexpr double kStalenessResetSec     = 2.0;  // prior expires after
 constexpr double kDefaultUserZCm        = 60.0; // cold-start Z guess
 // Z sanity bounds. Was [20, 200] cm. Tightened to [30, 120]: a
 // head closer than 30 cm to a desktop webcam is physically jammed
@@ -348,6 +362,20 @@ cv::Matx33d head_to_camera_rotation(double yaw, double pitch, double roll) {
     return R_flip * (Ry * Rx * Rz);
 }
 
+double rotation_delta_deg(const cv::Vec3d& a_rvec, const cv::Vec3d& b_rvec) {
+    cv::Mat A, B;
+    cv::Rodrigues(a_rvec, A);
+    cv::Rodrigues(b_rvec, B);
+    if (A.rows != 3 || A.cols != 3 || B.rows != 3 || B.cols != 3)
+        return 180.0;
+
+    const cv::Mat D = A * B.t();
+    const double tr =
+        D.at<double>(0, 0) + D.at<double>(1, 1) + D.at<double>(2, 2);
+    const double c = std::max(-1.0, std::min(1.0, (tr - 1.0) * 0.5));
+    return std::acos(c) * 180.0 / CV_PI;
+}
+
 } // anonymous namespace
 
 // Helper: write a debug-log line with all the solver-input + outcome
@@ -418,22 +446,22 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
     // worse than the cold-start "user at arm's length, centered"
     // assumption further down.
     //
-    // Rotation: we DON'T gate on freshness because the IMU runs at
-    // ~2 kHz independent of the camera, so the yaw/pitch/roll we got
-    // passed in is essentially current regardless of how long it's
-    // been since the last successful PnP. The IMU-derived rotation
-    // prior is therefore always preferable to either the cached
-    // state_rvec (which can be stale by definition if we lost
-    // tracking) or the previous fallback of (0, 0, 0) which silently
-    // told the visibility filter "head faces dead-ahead at the
-    // camera" and admitted only the front-facing 5 LEDs no matter
-    // which way the user was actually looking.
+    // Rotation: if the camera has a fresh accepted pose, use its rvec
+    // for the next optical solve even when the IMU is live. The IMU's
+    // yaw/pitch/roll remain the user-visible rotation output, but its
+    // body-frame convention has proven too different from the optical
+    // LED model to lock translation against it. Using the cached camera
+    // rvec keeps the projected LED layout coherent so XYZ can update
+    // continuously instead of falling into HIGH_RMS and holding stale
+    // coordinates. Without a camera prior, fall back to the IMU/default
+    // rotation as a cold-start guess.
     //
     // NOTE: hoisted above the kMinInliers early-return so the per-LED
     // facing-camera dot-product diagnostic below has a prior_tvec to
     // work with even on frames where the extractor delivered too few
     // blobs to run PnP. That gating fail is exactly when we most want
     // visibility into "would the matcher have seen anything anyway?".
+    cv::Vec3d prior_rvec_cached;
     cv::Vec3d prior_tvec;
     bool      have_prior;
     {
@@ -441,7 +469,19 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
         const bool fresh = s.state_valid &&
                            (steady_now_sec() - s.state_epoch_sec) < kStalenessResetSec;
         have_prior = fresh;
+        prior_rvec_cached = s.state_rvec;
         prior_tvec = have_prior ? s.state_tvec : cv::Vec3d(0, 0, kDefaultUserZCm);
+    }
+
+    cv::Matx33d R = head_to_camera_rotation(yaw_rad, pitch_rad, roll_rad);
+    if (have_prior) {
+        cv::Mat R_cached;
+        cv::Rodrigues(prior_rvec_cached, R_cached);
+        if (R_cached.rows == 3 && R_cached.cols == 3) {
+            for (int r_i = 0; r_i < 3; ++r_i)
+                for (int c_i = 0; c_i < 3; ++c_i)
+                    R(r_i, c_i) = R_cached.at<double>(r_i, c_i);
+        }
     }
 
     // Per-LED facing-camera dot-product diagnostic, every 60 solves
@@ -464,9 +504,7 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
     // down and never runs when blobs<kMinInliers, so the diagnostic
     // legitimately reflects what the solver was looking at.
     if ((this_frame % 60) == 0) {
-        const cv::Matx33d R_dbg =
-            head_to_camera_rotation(yaw_rad, pitch_rad, roll_rad);
-        const cv::Vec3d   C_dbg = -(R_dbg.t() * prior_tvec);
+        const cv::Vec3d   C_dbg = -(R.t() * prior_tvec);
         char buf[320];
         int  off = std::snprintf(buf, sizeof buf,
             "[psvr-cam] vis-detail: prior=%s tvec=(%+.1f,%+.1f,%+.1f) "
@@ -496,7 +534,6 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
         return r;
     }
 
-    const cv::Matx33d R = head_to_camera_rotation(yaw_rad, pitch_rad, roll_rad);
     // Camera intrinsics from the user-configured HFOV. Was a TU-
     // constant kDefaultHFOVDeg=70 here; now plumbed from the dialog's
     // Camera HFOV spinbox via psvr_cam::Worker::set_hfov_deg so the
@@ -583,6 +620,7 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
     // by back-projecting the blob centroid to kDefaultUserZCm, so
     // C_head lands near (small, small, -60) and the front-facing
     // LEDs pass while the rear ones don't.
+    constexpr int kMinVisibleForPnp = 4;
     std::array<cv::Point2d, NUM_LEDS> projected;
     std::array<bool, NUM_LEDS>        visible{};
     for (int i = 0; i < NUM_LEDS; ++i) {
@@ -622,6 +660,39 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
         r.visible[i]   = true;
     }
 
+    auto visible_count = [&visible]() {
+        int n = 0;
+        for (bool v : visible)
+            if (v) ++n;
+        return n;
+    };
+
+    if (visible_count() < kMinVisibleForPnp) {
+        // The free camera-pose rvec can land on the planar-PnP twin that
+        // reprojects well but makes the LED normals look self-occluded.
+        // If that leaves too few candidates to solve XYZ, relax only the
+        // normal-facing test for this frame. The later RANSAC, RMS, Z,
+        // and jump gates still decide whether the correspondence is safe
+        // to publish.
+        for (int i = 0; i < NUM_LEDS; ++i) {
+            const cv::Vec3d model_pt(kLEDModel[i].x, kLEDModel[i].y, kLEDModel[i].z);
+            const cv::Vec3d P = R * model_pt + prior_tvec;
+            if (P(2) <= 1.0) { visible[i] = false; r.visible[i] = false; continue; }
+
+            const double u = K(0, 0) * P(0) / P(2) + K(0, 2);
+            const double v = K(1, 1) * P(1) / P(2) + K(1, 2);
+            if (u < 0 || u >= img_w || v < 0 || v >= img_h) {
+                visible[i] = false;
+                r.visible[i] = false;
+                continue;
+            }
+            projected[i] = cv::Point2d(u, v);
+            visible[i] = true;
+            r.projected[i] = projected[i];
+            r.visible[i] = true;
+        }
+    }
+
     // Permutation-RANSAC correspondence search. With a handful of real
     // LED blobs out of a noisy set, greedy NN (which we used
     // previously) often paired a real blob with the wrong LED index
@@ -635,7 +706,7 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
     // the best. O(kSamples * cost(AP3P)) ~= 300 * 80us = 24ms/frame
     // max, well under our 33ms budget. The kSamples cap keeps worst
     // case bounded regardless of blob count.
-    const int k = 4;  // min for P3P + disambiguation
+    const int k = kMinVisibleForPnp;  // min for P3P + disambiguation
     if ((int)blobs.size() < k) {
         r.reject_reason = "TOO_FEW_BLOBS";
         log_frame(dbg, yaw_rad, pitch_rad, roll_rad, prior_tvec,
@@ -668,100 +739,177 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
     const double inlier_px2 = kPermSearchInlierPx * kPermSearchInlierPx;
     const std::vector<double> no_distortion;
 
+    struct MatchCandidate {
+        double d2;
+        int    led;
+        int    blob;
+    };
+
     std::vector<int> best_led_indices;
     std::vector<int> best_blob_indices;
     int              best_inliers = 0;
+    double           best_match_error = 1e300;
+    double           best_prior_d2 = 1e300;
     cv::Vec3d        best_rvec, best_tvec;
+    bool             best_from_prior = false;
 
     std::vector<int> led_pick(k), blob_pick(k);
     std::vector<cv::Point3d> obj_sample(k);
     std::vector<cv::Point2d> img_sample(k);
 
-    for (int iter = 0; iter < kSamples; ++iter) {
-        // Random k-subset of visible LEDs (sample without replacement).
-        for (int i = 0; i < k; ++i) {
-            int idx;
-            bool clash;
-            do {
-                idx = rng.uniform(0, (int)visible_leds.size());
-                clash = false;
-                for (int p = 0; p < i; ++p)
-                    if (led_pick[p] == idx) { clash = true; break; }
-            } while (clash);
-            led_pick[i] = idx;
-        }
-        // Random k-subset of blobs (sample without replacement).
-        for (int i = 0; i < k; ++i) {
-            int idx;
-            bool clash;
-            do {
-                idx = rng.uniform(0, (int)blobs.size());
-                clash = false;
-                for (int p = 0; p < i; ++p)
-                    if (blob_pick[p] == idx) { clash = true; break; }
-            } while (clash);
-            blob_pick[i] = idx;
-        }
-        // Build the sample correspondences.
-        for (int i = 0; i < k; ++i) {
-            const int li = visible_leds[led_pick[i]];
-            obj_sample[i] = kLEDModel[li];
-            img_sample[i] = blobs[blob_pick[i]];
-        }
-        // Solve with AP3P (fast, needs exactly 4 for disambiguation).
-        cv::Vec3d trial_rvec = prior_rvec;
-        cv::Vec3d trial_tvec = prior_tvec;
-        if (!cv::solvePnP(obj_sample, img_sample, cv::Mat(K),
-                          no_distortion, trial_rvec, trial_tvec,
-                          /*useExtrinsicGuess=*/false,
-                          cv::SOLVEPNP_AP3P))
-            continue;
-        // Quick z-sanity reject before the expensive reproject.
-        if (trial_tvec(2) < kMinAcceptableZCm ||
-            trial_tvec(2) > kMaxAcceptableZCm) continue;
-        // Prior-consistency reject: when we have a fresh last-accepted
-        // pose, the solver shouldn't consider hypotheses that place
-        // the head more than kMaxCmPerFrame away. Otherwise it
-        // alternates between two geometrically consistent LED-to-
-        // blob assignments whose 3D poses differ by 10-20 cm,
-        // producing the "XYZ jumping all over" symptom. Dropping
-        // these hypotheses here (not just at the final jump gate)
-        // lets the inlier-count race be won by the correct cluster.
-        if (have_prior) {
-            const cv::Vec3d d = trial_tvec - prior_tvec;
-            if (d.dot(d) > kMaxCmPerFrame * kMaxCmPerFrame) continue;
-        }
-        // Reproject the full 9-LED model and count blob inliers.
-        std::array<cv::Point3d, NUM_LEDS> all_leds;
-        for (int i = 0; i < NUM_LEDS; ++i) all_leds[i] = kLEDModel[i];
-        std::vector<cv::Point2d> proj_all;
-        cv::projectPoints(std::vector<cv::Point3d>(all_leds.begin(),
-                                                   all_leds.end()),
-                          trial_rvec, trial_tvec, cv::Mat(K),
-                          no_distortion, proj_all);
-        int inliers_this = 0;
-        std::vector<int> leds_used, blobs_used;
-        for (int i = 0; i < NUM_LEDS; ++i) {
-            double best_d2 = inlier_px2;
-            int    best_b  = -1;
-            for (size_t j = 0; j < blobs.size(); ++j) {
-                const double dx = blobs[j].x - proj_all[i].x;
-                const double dy = blobs[j].y - proj_all[i].y;
+    if (have_prior) {
+        const double prior_px2 = kPriorMatchDistPx * kPriorMatchDistPx;
+        std::vector<MatchCandidate> prior_matches;
+        prior_matches.reserve(visible_leds.size() * blobs.size());
+        for (int li : visible_leds) {
+            for (size_t bj = 0; bj < blobs.size(); ++bj) {
+                const double dx = blobs[bj].x - projected[li].x;
+                const double dy = blobs[bj].y - projected[li].y;
                 const double d2 = dx * dx + dy * dy;
-                if (d2 < best_d2) { best_d2 = d2; best_b = (int)j; }
-            }
-            if (best_b >= 0) {
-                ++inliers_this;
-                leds_used.push_back(i);
-                blobs_used.push_back(best_b);
+                if (d2 < prior_px2)
+                    prior_matches.push_back({d2, li, (int)bj});
             }
         }
-        if (inliers_this > best_inliers) {
-            best_inliers = inliers_this;
-            best_rvec = trial_rvec;
-            best_tvec = trial_tvec;
-            best_led_indices  = leds_used;
-            best_blob_indices = blobs_used;
+        std::sort(prior_matches.begin(), prior_matches.end(),
+                  [](const MatchCandidate& a, const MatchCandidate& b) {
+                      return a.d2 < b.d2;
+                  });
+
+        std::array<bool, NUM_LEDS> led_claimed{};
+        std::vector<bool> blob_claimed(blobs.size(), false);
+        double match_error = 0.0;
+        for (const MatchCandidate& mc : prior_matches) {
+            if (led_claimed[mc.led] || blob_claimed[mc.blob])
+                continue;
+            led_claimed[mc.led] = true;
+            blob_claimed[mc.blob] = true;
+            best_led_indices.push_back(mc.led);
+            best_blob_indices.push_back(mc.blob);
+            match_error += mc.d2;
+        }
+        best_inliers = (int)best_led_indices.size();
+        if (best_inliers > 0) {
+            best_match_error = match_error;
+            best_prior_d2 = 0.0;
+            best_rvec = prior_rvec;
+            best_tvec = prior_tvec;
+            best_from_prior = best_inliers >= kMinInliers;
+        }
+    }
+
+    if (!best_from_prior) {
+        for (int iter = 0; iter < kSamples; ++iter) {
+            // Random k-subset of visible LEDs (sample without replacement).
+            for (int i = 0; i < k; ++i) {
+                int idx;
+                bool clash;
+                do {
+                    idx = rng.uniform(0, (int)visible_leds.size());
+                    clash = false;
+                    for (int p = 0; p < i; ++p)
+                        if (led_pick[p] == idx) { clash = true; break; }
+                } while (clash);
+                led_pick[i] = idx;
+            }
+            // Random k-subset of blobs (sample without replacement).
+            for (int i = 0; i < k; ++i) {
+                int idx;
+                bool clash;
+                do {
+                    idx = rng.uniform(0, (int)blobs.size());
+                    clash = false;
+                    for (int p = 0; p < i; ++p)
+                        if (blob_pick[p] == idx) { clash = true; break; }
+                } while (clash);
+                blob_pick[i] = idx;
+            }
+            // Build the sample correspondences.
+            for (int i = 0; i < k; ++i) {
+                const int li = visible_leds[led_pick[i]];
+                obj_sample[i] = kLEDModel[li];
+                img_sample[i] = blobs[blob_pick[i]];
+            }
+            // Solve with AP3P (fast, needs exactly 4 for disambiguation).
+            cv::Vec3d trial_rvec = prior_rvec;
+            cv::Vec3d trial_tvec = prior_tvec;
+            if (!cv::solvePnP(obj_sample, img_sample, cv::Mat(K),
+                              no_distortion, trial_rvec, trial_tvec,
+                              /*useExtrinsicGuess=*/false,
+                              cv::SOLVEPNP_AP3P))
+                continue;
+            // Quick z-sanity reject before the expensive reproject.
+            if (trial_tvec(2) < kMinAcceptableZCm ||
+                trial_tvec(2) > kMaxAcceptableZCm) continue;
+            // Prior-consistency reject: when we have a fresh last-accepted
+            // pose, the solver shouldn't consider hypotheses that place
+            // the head more than kMaxCmPerFrame away. Otherwise it
+            // alternates between two geometrically consistent LED-to-
+            // blob assignments whose 3D poses differ by 10-20 cm,
+            // producing the "XYZ jumping all over" symptom. Dropping
+            // these hypotheses here (not just at the final jump gate)
+            // lets the inlier-count race be won by the correct cluster.
+            if (have_prior) {
+                const cv::Vec3d d = trial_tvec - prior_tvec;
+                if (d.dot(d) > kMaxCmPerFrame * kMaxCmPerFrame) continue;
+                if (rotation_delta_deg(trial_rvec, prior_rvec_cached) >
+                    kMaxCameraRotDegPerFrame) {
+                    continue;
+                }
+            }
+            // Reproject the full 9-LED model and count blob inliers.
+            std::array<cv::Point3d, NUM_LEDS> all_leds;
+            for (int i = 0; i < NUM_LEDS; ++i) all_leds[i] = kLEDModel[i];
+            std::vector<cv::Point2d> proj_all;
+            cv::projectPoints(std::vector<cv::Point3d>(all_leds.begin(),
+                                                       all_leds.end()),
+                              trial_rvec, trial_tvec, cv::Mat(K),
+                              no_distortion, proj_all);
+            std::vector<MatchCandidate> match_candidates;
+            match_candidates.reserve(NUM_LEDS * blobs.size());
+            for (int i = 0; i < NUM_LEDS; ++i) {
+                for (size_t j = 0; j < blobs.size(); ++j) {
+                    const double dx = blobs[j].x - proj_all[i].x;
+                    const double dy = blobs[j].y - proj_all[i].y;
+                    const double d2 = dx * dx + dy * dy;
+                    if (d2 < inlier_px2)
+                        match_candidates.push_back({d2, i, (int)j});
+                }
+            }
+            std::sort(match_candidates.begin(), match_candidates.end(),
+                      [](const MatchCandidate& a, const MatchCandidate& b) {
+                          return a.d2 < b.d2;
+                      });
+
+            int inliers_this = 0;
+            double match_error = 0.0;
+            std::vector<int> leds_used, blobs_used;
+            std::array<bool, NUM_LEDS> led_claimed{};
+            std::vector<bool> blob_claimed(blobs.size(), false);
+            for (const MatchCandidate& mc : match_candidates) {
+                if (led_claimed[mc.led] || blob_claimed[mc.blob])
+                    continue;
+                led_claimed[mc.led] = true;
+                blob_claimed[mc.blob] = true;
+                ++inliers_this;
+                match_error += mc.d2;
+                leds_used.push_back(mc.led);
+                blobs_used.push_back(mc.blob);
+            }
+            const cv::Vec3d prior_delta = trial_tvec - prior_tvec;
+            const double prior_d2 = prior_delta.dot(prior_delta);
+            if (inliers_this > best_inliers ||
+                (inliers_this == best_inliers &&
+                 (match_error < best_match_error ||
+                  (match_error == best_match_error && prior_d2 < best_prior_d2)))) {
+                best_inliers = inliers_this;
+                best_match_error = match_error;
+                best_prior_d2 = prior_d2;
+                best_rvec = trial_rvec;
+                best_tvec = trial_tvec;
+                best_from_prior = false;
+                best_led_indices  = leds_used;
+                best_blob_indices = blobs_used;
+            }
         }
     }
 
@@ -803,195 +951,70 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
     prior_tvec = best_tvec;
 
     // ----------------------------------------------------------------
-    // IMU-rotation-locked translation solve (planar-PnP ambiguity fix)
-    // ----------------------------------------------------------------
-    // In a dark room the camera reliably sees only the ~5 LEDs on the
-    // FRONT of the visor, which are very nearly COPLANAR. Monocular PnP
-    // on a planar (or near-planar) point set has the classic two-fold
-    // pose ambiguity: two distinct rotations reproject the points
-    // almost equally well. A free-rotation solver flips between them
-    // frame to frame, so the recovered position jumps between two
-    // interpretations - the alternating pnp=OK / reject=JUMP symptom.
-    //
-    // We are not actually short of rotation information, though: the
-    // PSVR IMU streams yaw/pitch/roll at ~2 kHz and is trustworthy. So
-    // rather than let PnP re-estimate (and flip) the rotation, we FIX
-    // rotation to the IMU's head_to_camera_rotation(...) == R and solve
-    // ONLY the 3-DOF translation t that best reprojects the matched
-    // LEDs. With R held constant the reprojection objective is a well-
-    // conditioned 3-unknown least squares with a unique minimiser for
-    // any non-degenerate correspondence set, so the two-fold flip
-    // cannot occur and the pose is stable while the blob set is stable.
-    //
-    // Solver: damped Gauss-Newton (Levenberg-Marquardt-ish). For each
-    // matched (model M_i, blob p_i): X_i = R*M_i + t, project to
-    //   u = fx*Xx/Xz + cx, v = fy*Xy/Xz + cy, residual = (u,v) - p_i.
-    // The 2x3 Jacobian of (u,v) w.r.t. t (dX/dt = I) is
-    //   [ fx/Xz   0      -fx*Xx/Xz^2 ]
-    //   [ 0       fy/Xz  -fy*Xy/Xz^2 ].
-    // Accumulate JtJ (3x3) + Jtr (3), add lambda*I damping (guards a
-    // singular / ill-conditioned JtJ), step t -= (JtJ+lambda*I)^-1 Jtr,
-    // and stop on a tiny step or after a fixed iteration cap.
-    //
-    // Fallback: if the IMU rotation is not yet trustworthy - all-zero
-    // yaw/pitch/roll AND no fresh prior, i.e. the helmet isn't
-    // streaming (camera-only bring-up with the headset unpowered) - we
-    // keep the legacy free-rotation cv::solvePnPRansac refine so
-    // camera-only testing still produces a pose. Once any lock exists
-    // (have_prior) OR the IMU reports a non-zero attitude we switch to
-    // the locked path. So "IMU present" == (yaw|pitch|roll != 0) OR
-    // have_prior.
-    const bool have_imu =
-        (yaw_rad != 0.0 || pitch_rad != 0.0 || roll_rad != 0.0) || have_prior;
-
+    // Final camera-pose refinement. The free-rotation rvec/tvec result is
+    // used only for optical XYZ tracking and for seeding the next frame's
+    // LED projection. It does NOT replace the user-visible rotation path:
+    // psvr.cpp continues to publish yaw/pitch/roll from the PSVR IMU.
+    // This avoids the stale-XYZ failure where locking translation to the
+    // IMU rotation produced persistent HIGH_RMS rejects while the camera
+    // could still see and solve the LEDs.
     cv::Vec3d rvec, tvec;
     double    rms           = 0.0;
     int       final_inliers = 0;
 
-    if (have_imu) {
-        // Rotation is exactly the IMU's R and is never touched by the
-        // translation solve below. Express R as a Rodrigues vector for
-        // the cached state / any rvec consumer. (prior_rvec was just
-        // overwritten with the hypothesis pose to seed the fallback, so
-        // recompute from R here rather than reuse it.)
-        {
-            cv::Mat R_imu(3, 3, CV_64F);
-            for (int i = 0; i < 3; ++i)
-                for (int j = 0; j < 3; ++j)
-                    R_imu.at<double>(i, j) = R(i, j);
-            cv::Rodrigues(R_imu, rvec);
+    rvec = prior_rvec;
+    tvec = prior_tvec;
+    std::vector<int> inlier_indices;
+    bool ok = false;
+    if (best_from_prior) {
+        ok = cv::solvePnP(obj_pts, img_pts, cv::Mat(K),
+                          no_distortion,
+                          rvec, tvec,
+                          /*useExtrinsicGuess=*/true,
+                          cv::SOLVEPNP_ITERATIVE);
+        if (ok) {
+            inlier_indices.reserve(obj_pts.size());
+            for (int i = 0; i < (int)obj_pts.size(); ++i)
+                inlier_indices.push_back(i);
         }
-        const double fx = K(0, 0), fy = K(1, 1);
-        const double cx = K(0, 2), cy = K(1, 2);
-        const int N = (int)obj_pts.size();
-        // Pre-rotate the model points once; only t changes per iter.
-        std::vector<cv::Vec3d> RM((size_t)N);
-        for (int i = 0; i < N; ++i)
-            RM[i] = R * cv::Vec3d(obj_pts[i].x, obj_pts[i].y, obj_pts[i].z);
-
-        // Seed: prefer the stable last-accepted translation when we
-        // have one (the hypothesis tvec can carry a flipped-rotation
-        // bias); otherwise use the hypothesis tvec, which already
-        // passed the search's Z-sanity gate.
-        cv::Vec3d t = have_prior ? jump_ref_tvec : best_tvec;
-        const double kLambda = 1e-3;   // LM damping, conditions JtJ
-        bool diverged = false;
-        for (int iter = 0; iter < 10; ++iter) {
-            cv::Matx33d JtJ = cv::Matx33d::zeros();
-            cv::Vec3d   Jtr(0, 0, 0);
-            bool bad = false;
-            for (int i = 0; i < N; ++i) {
-                const cv::Vec3d X = RM[i] + t;
-                const double Xz = X(2);
-                if (Xz <= 1.0) { bad = true; break; }   // behind camera
-                const double inv = 1.0 / Xz;
-                const double u   = fx * X(0) * inv + cx;
-                const double v   = fy * X(1) * inv + cy;
-                const double ru  = u - img_pts[i].x;
-                const double rv  = v - img_pts[i].y;
-                const double Ju0 = fx * inv;
-                const double Ju2 = -fx * X(0) * inv * inv;
-                const double Jv1 = fy * inv;
-                const double Jv2 = -fy * X(1) * inv * inv;
-                JtJ(0, 0) += Ju0 * Ju0;
-                JtJ(0, 2) += Ju0 * Ju2;
-                JtJ(1, 1) += Jv1 * Jv1;
-                JtJ(1, 2) += Jv1 * Jv2;
-                JtJ(2, 0) += Ju2 * Ju0;
-                JtJ(2, 1) += Jv2 * Jv1;
-                JtJ(2, 2) += Ju2 * Ju2 + Jv2 * Jv2;
-                Jtr(0)    += Ju0 * ru;
-                Jtr(1)    += Jv1 * rv;
-                Jtr(2)    += Ju2 * ru + Jv2 * rv;
-            }
-            if (bad) { diverged = true; break; }
-            // Damped normal equations. JtJ is symmetric PSD; +lambda*I
-            // makes it positive-definite so Cholesky is valid and the
-            // inverse exists even for a (near-)degenerate correspondence
-            // geometry.
-            cv::Matx33d A = JtJ;
-            A(0, 0) += kLambda; A(1, 1) += kLambda; A(2, 2) += kLambda;
-            bool inv_ok = false;
-            const cv::Matx33d Ainv = A.inv(cv::DECOMP_CHOLESKY, &inv_ok);
-            if (!inv_ok) { diverged = true; break; }
-            const cv::Vec3d dt = Ainv * Jtr;
-            if (dt(0) != dt(0) || dt(1) != dt(1) || dt(2) != dt(2)) {
-                diverged = true; break;                 // NaN guard
-            }
-            t -= dt;
-            if (dt.dot(dt) < 1e-6) break;               // < 0.001 cm step
-        }
-
-        // Divergence cap / sanity: a point fell behind the camera, the
-        // normal equations were unsolvable, the step went NaN, or the
-        // solved depth is non-positive. Bail with a dedicated reason so
-        // it shows up in the [psvr-cam] reject summary.
-        if (diverged || t(2) <= 0.0) {
-            r.reject_reason = "T_SOLVE_DIVERGED";
-            log_frame(dbg, yaw_rad, pitch_rad, roll_rad, jump_ref_tvec,
-                      blobs, projected, visible,
-                      (int)obj_pts.size(), false, 0, t,
-                      "REJECT_T_SOLVE_DIVERGED");
-            return r;
-        }
-
-        tvec = t;
-        double sum_sq = 0.0;
-        for (int i = 0; i < N; ++i) {
-            const cv::Vec3d X = RM[i] + t;
-            const double inv = 1.0 / X(2);
-            const double dx = (fx * X(0) * inv + cx) - img_pts[i].x;
-            const double dy = (fy * X(1) * inv + cy) - img_pts[i].y;
-            sum_sq += dx * dx + dy * dy;
-        }
-        rms           = std::sqrt(sum_sq / (double)N);
-        final_inliers = N;
-        r.n_matched   = N;
     } else {
-        // FALLBACK (no IMU yet): legacy free-rotation refine via
-        // solvePnPRansac. Lets camera-only bring-up with the helmet
-        // unpowered still solve a full pose (rotation included) until
-        // the IMU starts streaming, at which point the locked path
-        // above takes over. The camera pipeline produces many spurious
-        // blobs (room lights, reflections, glare), so RANSAC rejects
-        // the outliers; inliers come back as indices into obj/img_pts.
-        rvec = prior_rvec;
-        tvec = prior_tvec;
-        // no_distortion already declared above in the permutation-RANSAC
-        // search block; reuse it here rather than re-declaring.
         cv::Mat inliers;
-        const bool ok = cv::solvePnPRansac(obj_pts, img_pts, cv::Mat(K),
-                                           no_distortion,
-                                           rvec, tvec,
-                                           /*useExtrinsicGuess=*/true,
-                                           kRansacIterations,
-                                           (float)kRansacInlierThreshPx,
-                                           /*confidence=*/0.99,
-                                           inliers,
-                                           cv::SOLVEPNP_ITERATIVE);
-        if (!ok || inliers.rows < kMinInliers) {
-            r.reject_reason = "RANSAC_FEW_INLIERS";
-            log_frame(dbg, yaw_rad, pitch_rad, roll_rad, prior_tvec,
-                      blobs, projected, visible,
-                      ok ? (int)inliers.rows : 0, false, 0, tvec,
-                      "REJECT_RANSAC_FEW_INLIERS");
-            return r;
+        ok = cv::solvePnPRansac(obj_pts, img_pts, cv::Mat(K),
+                                no_distortion,
+                                rvec, tvec,
+                                /*useExtrinsicGuess=*/true,
+                                kRansacIterations,
+                                (float)kRansacInlierThreshPx,
+                                /*confidence=*/0.99,
+                                inliers,
+                                cv::SOLVEPNP_ITERATIVE);
+        if (ok) {
+            inlier_indices.reserve(inliers.rows);
+            for (int kk = 0; kk < inliers.rows; ++kk)
+                inlier_indices.push_back(inliers.at<int>(kk, 0));
         }
-        final_inliers = (int)inliers.rows;
-        r.n_matched   = final_inliers;
-
-        // RMS over INLIERS only; discarded outliers must not poison it.
-        std::vector<cv::Point2d> reproj;
-        cv::projectPoints(obj_pts, rvec, tvec, cv::Mat(K), no_distortion, reproj);
-        double sum_sq = 0.0;
-        for (int kk = 0; kk < inliers.rows; ++kk) {
-            const int i = inliers.at<int>(kk, 0);
-            const double dx = reproj[i].x - img_pts[i].x;
-            const double dy = reproj[i].y - img_pts[i].y;
-            sum_sq += dx * dx + dy * dy;
-        }
-        rms = std::sqrt(sum_sq / (double)inliers.rows);
     }
+    if (!ok || (int)inlier_indices.size() < kMinInliers) {
+        r.reject_reason = "RANSAC_FEW_INLIERS";
+        log_frame(dbg, yaw_rad, pitch_rad, roll_rad, prior_tvec,
+                  blobs, projected, visible,
+                  ok ? (int)inlier_indices.size() : 0, false, 0, tvec,
+                  "REJECT_RANSAC_FEW_INLIERS");
+        return r;
+    }
+    final_inliers = (int)inlier_indices.size();
+    r.n_matched   = final_inliers;
+
+    // RMS over INLIERS only; discarded outliers must not poison it.
+    std::vector<cv::Point2d> reproj;
+    cv::projectPoints(obj_pts, rvec, tvec, cv::Mat(K), no_distortion, reproj);
+    double sum_sq = 0.0;
+    for (const int i : inlier_indices) {
+        const double dx = reproj[i].x - img_pts[i].x;
+        const double dy = reproj[i].y - img_pts[i].y;
+        sum_sq += dx * dx + dy * dy;
+    }
+    rms = std::sqrt(sum_sq / (double)inlier_indices.size());
 
     r.reprojection_rms = rms;
     if (rms > kMaxReprojectionRMSPx) {
@@ -999,6 +1022,15 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
         log_frame(dbg, yaw_rad, pitch_rad, roll_rad, prior_tvec,
                   blobs, projected, visible,
                   r.n_matched, true, rms, tvec, "REJECT_HIGH_RMS");
+        return r;
+    }
+
+    if (jump_ref_valid &&
+        rotation_delta_deg(rvec, prior_rvec_cached) > kMaxCameraRotDegPerFrame) {
+        r.reject_reason = "ROT_JUMP";
+        log_frame(dbg, yaw_rad, pitch_rad, roll_rad, jump_ref_tvec,
+                  blobs, projected, visible,
+                  r.n_matched, true, rms, tvec, "REJECT_ROT_JUMP");
         return r;
     }
 
@@ -1048,11 +1080,59 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
     // smoothed it through to opentrack's output, producing the
     // visible "green dots flash, X/Y/Z jumps" symptom.
     if (!jump_ref_valid && final_inliers < kStrongLockMinInliers) {
-        r.reject_reason = "WEAK_FIRST_LOCK";
-        log_frame(dbg, yaw_rad, pitch_rad, roll_rad, prior_tvec,
-                  blobs, projected, visible,
-                  r.n_matched, true, rms, tvec, "REJECT_WEAK_FIRST_LOCK");
-        return r;
+        if (final_inliers >= kMinInliers && rms <= kFirstLock4LedMaxRMSPx) {
+            const double now_sec = steady_now_sec();
+            bool promote = false;
+            int hits = 1;
+            {
+                std::lock_guard<std::mutex> lk(s.state_mu);
+                const bool fresh =
+                    s.tentative_valid &&
+                    (now_sec - s.tentative_epoch_sec) <= kFirstLockTentativeSec;
+                if (fresh) {
+                    const cv::Vec3d d = tvec - s.tentative_tvec;
+                    if (d.dot(d) <= kFirstLock4LedMaxCm * kFirstLock4LedMaxCm) {
+                        s.tentative_hits++;
+                        s.tentative_tvec = tvec;
+                    } else {
+                        s.tentative_hits = 1;
+                        s.tentative_tvec = tvec;
+                    }
+                } else {
+                    s.tentative_valid = true;
+                    s.tentative_hits = 1;
+                    s.tentative_tvec = tvec;
+                }
+                s.tentative_epoch_sec = now_sec;
+                hits = s.tentative_hits;
+                promote = hits >= kFirstLock4LedHits;
+            }
+            if (!promote) {
+                r.reject_reason = "TENTATIVE_FIRST_LOCK";
+                log_frame(dbg, yaw_rad, pitch_rad, roll_rad, prior_tvec,
+                          blobs, projected, visible,
+                          r.n_matched, true, rms, tvec,
+                          "REJECT_TENTATIVE_FIRST_LOCK");
+                return r;
+            }
+            if (dbg) {
+                std::fprintf(dbg,
+                    "# promoting 4-LED tentative first lock after %d close frames\n",
+                    hits);
+                std::fflush(dbg);
+            }
+        } else {
+            {
+                std::lock_guard<std::mutex> lk(s.state_mu);
+                s.tentative_valid = false;
+                s.tentative_hits = 0;
+            }
+            r.reject_reason = "WEAK_FIRST_LOCK";
+            log_frame(dbg, yaw_rad, pitch_rad, roll_rad, prior_tvec,
+                      blobs, projected, visible,
+                      r.n_matched, true, rms, tvec, "REJECT_WEAK_FIRST_LOCK");
+            return r;
+        }
     }
 
     // Accept. Cache as prior for the next frame and pass tvec through
@@ -1072,6 +1152,8 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
         s.state_tvec      = tvec;
         s.state_epoch_sec = steady_now_sec();
         s.state_valid     = true;
+        s.tentative_valid = false;
+        s.tentative_hits  = 0;
     }
 
     r.ok   = true;

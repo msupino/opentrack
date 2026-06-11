@@ -1,18 +1,62 @@
 ---
 name: opentrack-build
 description: >-
-  Build, install, and ship the opentrack codebase on macOS. Covers the
-  dev/hot-install.sh inner-loop workflow, when to use it vs. a full
-  make install + macdeployqt pass, the Qt lupdate / lang/*.ts translation
-  regeneration workflow (including the git-ignored-locales gotcha), and
-  the upstream-PR splitting convention. Use when the user mentions
-  hot-install.sh, macdeployqt, make install, the bundle layout, opentrack.app
-  rebuilds, Qt linking issues during dev, lupdate, lang/*.ts files, the
-  proto-iokit-foohid translations, or how to organise PRs for upstream
-  opentrack/opentrack.
+  Build, install, run, and ship the opentrack codebase on macOS. Covers
+  prerequisites (Homebrew qt/opencv/cmake/pkg-config/libusb), first-time
+  cmake configure, the dev/hot-install.sh inner-loop, the full
+  make install + macdeployqt + make-app-bundle.sh path, the app/dock
+  icon pipeline, running opentrack with stderr capture, macOS TCC
+  permissions, the Apple-Silicon CMakeCache /usr/local gotcha, the Qt
+  lupdate / lang/*.ts translation workflow, and the upstream-PR
+  splitting convention. Use when the user mentions building/running
+  opentrack, hot-install.sh, macdeployqt, make install, cmake configure,
+  the bundle layout, opentrack.app rebuilds, Qt linking/double-load
+  issues, the dock/app icon or opentrack.icns, Input Monitoring/Camera
+  permissions, lupdate/lang/*.ts, or upstream PRs to opentrack/opentrack.
 ---
 
-# opentrack — build, install, package
+# opentrack — build, install, run, package (macOS)
+
+Uses Qt6 (Homebrew), CMake, OpenCV. Verified on Apple Silicon
+(`/opt/homebrew`); Intel (`/usr/local`) is analogous. See the sibling
+skills `opentrack-osx-issues` and `opentrack-psvr-issues`, and the
+repo-root `ARCHITECTURE.md`.
+
+## Prerequisites
+
+```bash
+brew install qt opencv cmake pkg-config libusb
+dev/setup-signing-cert.sh     # local "opentrack-dev" cert for hot-install
+```
+
+- **qt** → Qt6 (found at `/opt/homebrew/opt/qtbase/...`)
+- **opencv** → camera trackers (psvr, pt, easy, aruco)
+- **libusb** → only tracker-psvr's PS4-Camera firmware uploader needs it
+
+### Apple-Silicon gotcha: stale /usr/local paths in CMakeCache
+A stale `build/CMakeCache.txt` can hard-code Intel tool paths and break
+the build:
+```
+make: /usr/local/bin/cmake: No such file or directory
+Could NOT find PkgConfig (missing: PKG_CONFIG_EXECUTABLE)
+```
+Fix (one-time): symlink the tools where the cache expects them, or
+reconfigure with explicit paths:
+```bash
+ln -sf /opt/homebrew/bin/cmake      /usr/local/bin/cmake
+ln -sf /opt/homebrew/bin/pkg-config /usr/local/bin/pkg-config
+# or: cmake -S . -B build -DPKG_CONFIG_EXECUTABLE=/opt/homebrew/bin/pkg-config
+```
+
+## First build (configure + compile + install)
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=RELEASE \
+      -DCMAKE_INSTALL_PREFIX="$PWD/install"
+cmake --build build -j8
+cmake --install build          # populates install/opentrack.app
+```
+Generator is Unix Makefiles (so `dev/hot-install.sh` can drive `make`).
 
 ## Inner-loop build: `dev/hot-install.sh`
 
@@ -38,12 +82,50 @@ the minimal `install_name_tool` surgery + re-sign without invoking
 - After `brew upgrade qt` → reconfigure, the old bundle libs won't find new Cellar paths.
 - For a release-quality bundle → use the proper `make install` + `macdeployqt` path.
 
-## Full-bundle build (`make install` + `macdeployqt`)
+## Full-bundle build (`make install` + `macosx/make-app-bundle.sh`)
 
-Slow (~10 min on a clean install). `macdeployqt` rewrites Qt links and
-re-resolves the Frameworks, but leaves stale rpaths and trips on
-`presets/README.txt` during deep code-signing — see the
-`opentrack-osx-issues` skill for the macdeployqt aftermath fixes.
+Slow (~10 min on a clean install). `make-app-bundle.sh` runs
+`macdeployqt` (copies Qt frameworks in), generates the `.icns` from
+`gui/images/opentrack.png`, and builds a DMG. `macdeployqt` leaves
+stale rpaths and trips on `presets/README.txt` during deep
+code-signing — see the `opentrack-osx-issues` skill for the aftermath
+fixes.
+
+## App / dock icon
+
+- Source of truth: `gui/images/opentrack.png` (the pink octopus logo).
+- The macOS `.icns` is generated **at package time** by
+  `make-app-bundle.sh`; no `.icns` is committed. `macosx/Info.plist`
+  sets `CFBundleIconFile = opentrack.icns`.
+- **`dev/hot-install.sh` does NOT generate the icon**, so a dev bundle
+  shows the generic white placeholder in the dock. Cosmetic. To install
+  one manually from a square PNG:
+```bash
+mkdir /tmp/o.iconset
+for s in 16 32 128 256 512; do
+  sips -z $s $s SRC.png --out /tmp/o.iconset/icon_${s}x${s}.png
+  sips -z $((s*2)) $((s*2)) SRC.png --out /tmp/o.iconset/icon_${s}x${s}@2x.png
+done
+iconutil -c icns /tmp/o.iconset -o install/opentrack.app/Contents/Resources/opentrack.icns
+codesign --force --deep --sign - install/opentrack.app && killall Dock
+```
+
+## Running opentrack
+
+```bash
+open install/opentrack.app                 # normal
+
+# stderr-capturing launch (REQUIRED to see plugin diagnostics like the
+# PSVR [psvr-cam] logs — Finder/`open` sends stderr to /dev/null):
+pkill -x opentrack
+nohup install/opentrack.app/Contents/MacOS/opentrack >/tmp/opentrack.log 2>&1 &
+```
+
+macOS permissions (System Settings → Privacy & Security), toggle
+off/on if stale after a rebuild:
+- **Input Monitoring** → PSVR USB-HID reads
+- **Camera** → any webcam tracker (psvr camera, pt, easy)
+- **Screen Recording** → only the PSVR display mirror
 
 ## Build assumptions
 
