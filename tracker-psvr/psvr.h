@@ -67,6 +67,12 @@ struct psvr_settings : opts {
     value<bool>    keepalive_enable;
     value<QString> keepalive_cmd;
     value<int>     keepalive_interval_s;
+    // Experimental anti-sleep: periodically re-send the FULL activation
+    // burst (0x17+0x11+0x23), not just the light keepalive, to try to
+    // reset the headset's ~8 min firmware inactivity sleep. Each burst
+    // stalls the IMU stream ~1-2 s, so the interval is set well under
+    // 8 min but as long as tolerable (e.g. 360 s). 0 = disabled.
+    value<int>     reactivate_interval_s;
     // Which camera the constellation worker should open. Empty means
     // "use the AVFoundation default" (legacy behavior: lid camera on
     // MacBooks). The key "camera-name" matches the convention used by
@@ -104,6 +110,7 @@ struct psvr_settings : opts {
         keepalive_enable(b, "keepalive-enable", false),
         keepalive_cmd(b, "keepalive-cmd", QStringLiteral("0x17")),
         keepalive_interval_s(b, "keepalive-interval-s", 60),
+        reactivate_interval_s(b, "reactivate-interval-s", 0),
         camera_name(b, "camera-name", {}),
         camera_hfov_deg(b, "camera-hfov-deg", 70.0),
         camera_hfov_auto(b, "camera-hfov-auto", true)
@@ -496,6 +503,10 @@ private:
     uint8_t keepalive_cmd_{0x17};
     int     keepalive_interval_s_{60};
     double  keepalive_next_time_{0.0};
+    // Experimental periodic full-activation-burst anti-sleep (see
+    // reactivate_interval_s in the settings struct). 0 = disabled.
+    int     reactivate_interval_s_{0};
+    double  reactivate_next_time_{0.0};
 
     void worker_loop();
     void send_activation(IOHIDDeviceRef device);

@@ -598,6 +598,17 @@ module_status PSVRTracker::start_tracker(QFrame* frame)
                            << "s on HID worker";
     }
 
+    // Experimental periodic full-activation-burst anti-sleep. 0 = off.
+    // Clamp to >=30 s when enabled so a typo can't fire the IMU-stalling
+    // burst every tick.
+    reactivate_interval_s_ = static_cast<int>(s_.reactivate_interval_s);
+    if (reactivate_interval_s_ > 0) {
+        reactivate_interval_s_ = std::max(30, reactivate_interval_s_);
+        qDebug().nospace() << "PSVR: periodic full re-activation burst every "
+                           << reactivate_interval_s_ << "s (anti-sleep test)";
+    }
+    reactivate_next_time_ = 0.0;
+
     worker_ = std::thread([this]{ worker_loop(); });
     if (s_.enable_mirror)
         psvr_mirror_start();
@@ -1446,6 +1457,9 @@ void PSVRTracker::worker_loop()
     keepalive_next_time_ = keepalive_enabled_
         ? worker_start_time_ + keepalive_interval_s_
         : 0.0;
+    reactivate_next_time_ = reactivate_interval_s_ > 0
+        ? worker_start_time_ + reactivate_interval_s_
+        : 0.0;
 
     while (!stop_) {
         CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.1, true);
@@ -1454,6 +1468,17 @@ void PSVRTracker::worker_loop()
         if (keepalive_enabled_ && now >= keepalive_next_time_) {
             send_keepalive_to_all();
             keepalive_next_time_ = now + keepalive_interval_s_;
+        }
+
+        // Experimental: periodically re-send the FULL activation burst to
+        // try to reset the firmware's ~8 min inactivity sleep that the
+        // light keepalive can't. Costs a ~1-2 s IMU stall per fire, so it
+        // runs on its own (long) interval, independent of the heartbeat.
+        if (reactivate_interval_s_ > 0 && now >= reactivate_next_time_) {
+            qDebug().nospace()
+                << "PSVR: periodic full re-activation burst (anti-sleep)";
+            send_activation_to_all();
+            reactivate_next_time_ = now + reactivate_interval_s_;
         }
 
         // Silent-stream detection. Two cases this needs to catch:
