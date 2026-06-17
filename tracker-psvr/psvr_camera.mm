@@ -220,12 +220,16 @@ static double requested_ov580_fps()
 // enough to keep a 2-3 px LED at ~150 cm range while still dropping
 // the salt-and-pepper noise that every webcam produces after grayscale
 // thresholding.
-// DIAGNOSTIC v2: dropped all the way to 1.0 to admit even single-pixel
-// LED dots. With area=1 plus circularity disabled below, virtually any
-// bright pixel cluster passes. Matcher's RANSAC + facing-camera filter
-// will discriminate real LEDs from noise. Tighten back toward 3-5
-// once we know blobs are reaching the matcher.
-static constexpr double BLOB_MIN_AREA_PX = 1.0;
+// DIAGNOSTIC v2 dropped this to 1.0 to admit even single-pixel LED dots.
+// Raised to 20: the re-enabled circularity gate kills ELONGATED window-
+// blind slats, but a few small near-square slat fragments still score
+// high circularity (measured area 4-18 px, circ 0.75-0.84) and would
+// slip through. Genuine LED blobs on the same capture were 115-300 px,
+// so a 20 px floor drops those fragments with wide margin while still
+// keeping a ~6 px-diameter LED for longer-range tracking. Pair with
+// BLOB_MIN_CIRCULARITY below: area kills the small round fragments,
+// circularity kills the large elongated slats.
+static constexpr double BLOB_MIN_AREA_PX = 20.0;
 static constexpr double BLOB_MAX_AREA_PX = 1500.0;
 
 // Minimum 4*PI*A/P^2 circularity. A geometric circle is 1.0; a real
@@ -233,10 +237,22 @@ static constexpr double BLOB_MAX_AREA_PX = 1500.0;
 // ranges 0.7-0.95. Highlights from room edges (monitor bezels, table
 // edges, glasses frames, the helmet's own metal trim) are elongated
 // and score 0.2-0.4. 0.55 was the original tight value; DIAGNOSTIC v2
-// disables the gate (0.0) so reflections off helmet plastic, partial
-// rim LEDs at off-axis poses, and pixelated dots all pass. The
-// matcher's RANSAC + facing-camera filter discriminate real LEDs.
-static constexpr double BLOB_MIN_CIRCULARITY = 0.0;
+// disabled the gate (0.0) so reflections off helmet plastic, partial
+// rim LEDs at off-axis poses, and pixelated dots all pass.
+//
+// Re-enabled at 0.45: field testing with a PS4 Camera facing a window
+// showed daylight through venetian-blind slats producing a cluster of
+// ELONGATED bright blobs in one image corner. With the gate off they
+// reached the matcher, which latched onto them as if they were front-
+// left LEDs - dragging the solved head position ~35 cm off axis (a
+// free-rotation PnP fit that still reprojected at acceptable RMS).
+// Measured on a real capture (de-interleaved OV580 left eye): the slats
+// score 0.20-0.41 circularity, the genuine LED blobs 0.52-0.65. 0.45
+// sits below the lowest measured LED so partially-saturated / motion-
+// blurred cores survive, while every slat fragment is rejected. Note the
+// OV580's center visor LED can saturate into a wider bar at some poses;
+// 0.45 leaves headroom for that without re-admitting the slats.
+static constexpr double BLOB_MIN_CIRCULARITY = 0.45;
 
 // Grayscale brightness threshold for the bright-blob mask is now
 // chosen ADAPTIVELY per frame from the gray histogram (see
@@ -1139,8 +1155,21 @@ static void process_frame(Worker::Impl* s, CVPixelBufferRef buf) {
     const double roll     = s->roll_rad.load(std::memory_order_relaxed);
     const double hfov_deg = s->desired_hfov_deg.load(std::memory_order_relaxed);
 
+    // Pass the DE-INTERLEAVED working-image dimensions, not the raw pixel
+    // buffer's. The blob centroids are in s->gray's coordinate space, and
+    // for the OV580 that gray is the 640x400 left eye carved out of the
+    // 1748x408 stereo buffer (w/h above). Feeding the solver 1748x408 put
+    // the intrinsics' principal point at (874,204) while blobs sit near
+    // x~300, so K was grossly wrong - free-rotation PnP masked it by
+    // absorbing the error into a skewed pose (a big contributor to the
+    // bogus X offset), but the IMU-rotation-locked solve cannot and just
+    // diverged. For non-OV580 cameras s->gray matches the buffer size, so
+    // this is correct for every camera.
+    const int solve_w = s->gray.cols;
+    const int solve_h = s->gray.rows;
     psvr_constellation::Result r =
-        s->solver_state.solve(blobs, w, h, yaw, pitch, roll, hfov_deg);
+        s->solver_state.solve(blobs, solve_w, solve_h, yaw, pitch, roll,
+                              hfov_deg);
 
     // Seqlock publish: bracket the multi-double mutation with two
     // increments of pos_seq so any concurrent reader either sees the
