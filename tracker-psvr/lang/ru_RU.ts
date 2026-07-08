@@ -95,6 +95,22 @@ Calibration: after USB comes up (up to ~15 s on first start), the tracker waits 
         <translation type="unfinished"></translation>
     </message>
     <message>
+        <source>Enable rotation tracking (yaw/pitch/roll)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Sends the IMU-derived head rotation to opentrack. Turn off to publish zero rotation (e.g. to source yaw/pitch/roll from another tracker in a Fusion setup).</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Enable position tracking (X/Y/Z)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Sends the camera-derived head position to opentrack. Turn off to publish zero position. Requires camera tracking below to actually produce a position.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
         <source>Enable camera-based position tracking [experimental]</source>
         <translation type="unfinished"></translation>
     </message>
