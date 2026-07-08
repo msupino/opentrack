@@ -1,0 +1,147 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.0//EN" "http://www.w3.org/TR/REC-html40/strict.dtd">
+<html>
+    <head><meta name="qrichtext" content="1" /><meta charset="utf-8" />
+        <style type="text/css">
+            body { font-family: 'Segoe UI', sans-serif; font-size: 10pt; }
+            p, li { white-space: pre-wrap; }
+            hr { height: 1px; border-width: 0; }
+            li.unchecked::marker { content: "\2610"; }
+            li.checked::marker { content: "\2612"; }
+            th { text-align:left; text-decoration: underline; padding-left:2em; }
+            td { padding-left:2em; }
+            sup { float:right; }
+            .back-link { text-decoration:none; color: rgb(200, 200, 200); }
+        </style>
+    </head>
+    <body>
+        <h1>PaperTracker</h1>
+        <p>PaperTracker is a paper marker tracking system that uses a simplified head model for pose estimation. Instead of using markers for direct positioning, it uses markers as spatial guides to determine the head model's position and orientation. Multiple markers can be used together for improved accuracy and a broader range of motion.</p>
+        <p>PaperTracker is compatible with <i>ArUco MIP 36h12</i>, <i>AprilTag 36h11</i>, and <i>Original ArUco</i> marker dictionaries.</p>
+
+        <h1>Contents <a href="#top" class="back-link">↑</a></h1>
+        <div><a href="#markersetup">Marker Setup</a></div>
+        <div><a href="#settings">Settings</a><div style="margin-left: 0.5em"><a href="#camera">Camera</a></div><div style="margin-left: 0.5em"><a href="#aruco">ArUco</a></div><div style="margin-left: 0.5em"><a href="#head">Head / Hat</a></div></div>
+        <div><a href="#troubleshooting">Troubleshooting</a></div>
+
+        <h1 id="markersetup">Marker Setup <a href="#top" class="back-link">↑</a></h1>
+        <p>The simplest setup has a single marker centered on the forehead:</p>
+        <p style="text-align: center; margin-top: 32px;"><img src="qrc:/images/markers-single.png" /></p>
+        <p style="text-align: center; margin-bottom: 32px;"><i>Figure 1: Single marker, centered, as seen from the top.</i></p>
+        <p>You can add additional markers to either side:</p>
+        <p style="text-align: center; margin-top: 32px;"><img src="qrc:/images/markers-centered.png" /></p>
+        <p style="text-align: center; margin-bottom: 32px;"><i>Figure 2: Centered marker with supplemental markers to either side.</i></p>
+        <p>You can also have have the markers offset instead of being centered:</p>
+        <p style="text-align: center; margin-top: 32px;"><img src="qrc:/images/markers-offset.png" /></p>
+        <p style="text-align: center; margin-bottom: 32px;"><i>Figure 3: Markers on opposite sides of the center line.</i></p>
+        <p>Finally, supplemental markers can be angled away from the head, if desired, for better visibility. The central marker (or markers) should be angled to follow the contour of the head or hat as in previous examples:</p>
+        <p style="text-align: center; margin-top: 32px;"><img src="qrc:/images/markers-angled.png" /></p>
+        <p style="text-align: center; margin-bottom: 32px;"><i>Figure 4: Centered marker with supplemental markers angled away from the head.</i></p>
+        <p>Setups where multiple markers are within view of the camera at the same time typically produce the most reliable and stable tracking.</p>
+
+        <h1 id="settings">Settings <a href="#top" class="back-link">↑</a></h1>
+        <h2 id="camera">Camera <a href="#top" class="back-link">↑</a></h2>
+        <p><b>Camera Name</b>: Select your camera from the dropdown menu.</p>
+        <p><b>Width and Height</b>: Enter a resolution supported by your camera. Common resolutions include:</p>
+        <p>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Width x Height</th>
+                        <th>Aspect Ratio</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>320 x 240</td>
+                        <td>Standard (4:3)</td>
+                    </tr>
+                    <tr>
+                        <td>640 x 480</td>
+                        <td>Standard (4:3)</td>
+                    </tr>
+                    <tr>
+                        <td>800 x 600</td>
+                        <td>Standard (4:3)</td>
+                    </tr>
+                    <tr>
+                        <td>1024 x 768</td>
+                        <td>Standard (4:3)</td>
+                    </tr>
+                    <tr>
+                        <td>1280 x 720</td>
+                        <td>Widescreen (16:9)</td>
+                    </tr>
+                    <tr>
+                        <td>1920 x 1080</td>
+                        <td>Widescreen (16:9)</td>
+                    </tr>
+                </tbody>
+            </table>
+        </p>
+        <p>A resolution of 640 x 480 or higher is recommended.</p>
+        <p><b>FPS</b>: The video stream's frame rate. 30 Hz is the most common; more advanced cameras may support 60 Hz or higher (which may require enabling Use MJPEG, depending on the camera). Lower frame rates are also possible, but 30 Hz or above is recommended.</p>
+        <p><b>Diagonal FOV</b>: The camera's diagonal field of view as specified by the manufacturer. Some manufacturers may provide the horizontal field of view instead, in which case the number must be converted to diagonal for accurate tracking. If these numbers are not readily available, the diagonal field of view may also be found by measuring the diagonal size of the camera frame (<i>D</i>) at a given distance (<i>d</i>) from the camera, with the formula <i>arctan(D / 2d) * 2</i>.</p>
+        <p><b>Zoom</b>: Digitally zoom in toward the center of the video frame, cropping it to a smaller size. This can help eliminate background elements that interfere with detection and may also reduce the processing load.</p>
+        <p><b>Use MJPEG</b>: Request an MJPEG video stream from the camera. Certain resolutions and frame rates may only be available in this mode, depending on the camera.</p>
+        <p><b>Settings (Open)</b>: Opens the system camera settings dialog.</p>
+
+        <h2 id="aruco">ArUco <a href="#top" class="back-link">↑</a></h2>
+        <p>Markers can be generated and printed at <a href="https://chev.me/arucogen/">chev.me/arucogen/</a>. Use double-sided tape or a thin layer of glue stick to affix the printed markers to a rigid surface like cardboard or a 3D-printed plate, then mount them on a hat or head band. Start the tracker with your head facing forward, looking straight at the monitor. Avoid mounting the markers such that they're flat to the camera while in this position as pose detection is less reliable when markers are facing the camera straight-on.</p>
+        <p><b>Dictionary</b>: PaperTracker supports the use of ArUco MIP 36h12, AprilTag 36h11, and Original ArUco markers. The first two are generally considered the most reliable (fewer false detections), while Original ArUco has slightly larger cells when printed at the same size as the others which may help with detection at lower resolutions.</p>
+        <p><b>Marker size</b>: The ideal marker size will depend on camera resolution, the maximum distance from the camera, and personal comfort. The lower the camera's resolution and the greater the distance from the camera, the larger the markers need to be. The default is 80mm, which is suitable for close to medium distances.</p>
+        <p>For best results always include a plain white border around the marker. This border should be at least the width of one marker cell (one of the black or white squares that make up the marker), and preferably the width of two cells. Small borders are likely to give poor results, especially at lower resolutions.</p>
+        <p>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Marker Dictionary</th>
+                        <th>Minimum Border Size</th>
+                        <th>Recommended Border Size</th>
+                    </tr>
+                </thead>
+                <tr>
+                    <td>ArUco MIP 36h12</td>
+                    <td>Marker size x 1⁄8</td>
+                    <td>Marker size x 2⁄8</td>
+                </tr>
+                <tr>
+                    <td>AprilTag 36h11</td>
+                    <td>Marker size x 1⁄8</td>
+                    <td>Marker size x 2⁄8</td>
+                </tr>
+                <tr>
+                    <td>Original ArUco</td>
+                    <td>Marker size x 1⁄7</td>
+                    <td>Marker size x 2⁄7</td>
+                </tr>
+            </table>
+        </p>
+        <p><i>Example: A 80 mm MIP 36h12 marker requires a 10 mm white border on all sides at a minimum, for a total mounted area of 100 × 100 mm. For better results a 20 mm border is recommended, for a total mounted area of 120 x 120 mm.</i></p>
+        <p><b>First marker ID</b>: The ID of the lowest-numbered marker. Markers should be numbered sequentially from this value. Together with the number of markers, this defines the range of IDs the tracker will look for. Any ID outside this range is ignored to guard against false detections.</p>
+        <p><b>Number of markers</b>: The maximum number of markers to use for pose estimation. For best performance, set this to the exact number of markers you are using.</p>
+        <p><b>Preferred marker angle (minimum)</b>: When using multiple markers, prioritize markers whose angle relative to the camera is greater than this value. This may help reduce the jitter that can be observed when some of the markers are nearly flat to the camera. If no detected markers meet this requirement the tracker will choose among the best available markers instead. The default is 15°.</p>
+        <p><b>Preferred marker angle (maximum)</b>: When using multiple markers, prioritize markers whose angle relative to the camera is less than this value. This may help reduce the jitter that can be observed when some of the markers are angled away from the camera, especially at lower resolutions or when marker borders are small. If no detected markers meet this requirement the tracker will choose among the best available markers instead. The default is 80°.</p>
+
+        <h2 id="head">Head / Hat <a href="#top" class="back-link">↑</a></h2>
+        <p>These measurements help the software translate marker movement into accurate head movement.</p>
+        <p><b>Circumference</b>: Measure around your head or hat at the exact level where the markers are positioned.</p>
+        <p><b>Head joint to marker distance</b>: Measure vertically from where the head joins the spine (roughly in line with the back of the jaw) to the marker level, used to determine the pivot point for head tilt and rotation.</p>
+
+        <h1 id="troubleshooting">Troubleshooting <a href="#top" class="back-link">↑</a></h1>
+        <p>If the tracking is too jittery you can try the following:</p>
+        <p>
+            <ul>
+                <li>Increase the size of your printed markers.</li>
+                <li>Give the markers a larger border.</li>
+                <li>Set the camera to a higher resolution.</li>
+                <li>Physically move closer to the camera.</li>
+                <li>Adjust your markers so they're not too flat or too slanted, as seen by the camera, when the tracker is started.</li>
+                <li>Choose a different marker configuration (see <a href="#markersetup">Marker Setup</a>).</li>
+                <li>Set the minimum preferred marker angle to a higher value.</li>
+                <li>Set the maximum preferred marker angle to a lower value.</li>
+                <li>Adjust filter settings to reduce or eliminate any remaining jitter.</li>
+            </ul>
+        </p>
+        <p>&nbsp;</p>
+    </body>
+</html>
