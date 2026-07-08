@@ -41,9 +41,8 @@ struct Result {
 
     // Short tag identifying the path that produced this Result. One
     // of: "OK", "TOO_FEW_BLOBS", "TOO_FEW_VISIBLE", "NO_AP3P_FIT",
-    // "RANSAC_FEW_INLIERS", "T_SOLVE_DIVERGED", "HIGH_RMS",
-    // "Z_OUT_OF_RANGE", "JUMP", "ROT_JUMP", "TENTATIVE_FIRST_LOCK",
-    // "WEAK_FIRST_LOCK".
+    // "T_SOLVE_DIVERGED", "HIGH_RMS", "Z_OUT_OF_RANGE", "JUMP",
+    // "TENTATIVE_FIRST_LOCK", "WEAK_FIRST_LOCK".
     // "T_SOLVE_DIVERGED" comes from the IMU-rotation-locked
     // translation-only Gauss-Newton path (rotation fixed to the IMU,
     // only t solved); the others from the free-rotation fallback.
