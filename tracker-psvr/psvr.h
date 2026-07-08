@@ -97,6 +97,14 @@ struct psvr_settings : opts {
     // restored when auto is turned back off. See
     // psvr_cam::recommended_hfov_for_camera for the mapping.
     value<bool>    camera_hfov_auto;
+    // Master enables for the two halves of the pose. enable_ypr gates the
+    // IMU rotation (yaw/pitch/roll); enable_xyz gates the position
+    // (X/Y/Z) the camera worker produces. Both default ON so existing
+    // profiles behave exactly as before. When a half is disabled, data()
+    // publishes zeros for those three channels so opentrack treats them
+    // as untracked (and a Fusion setup can source them elsewhere).
+    value<bool>    enable_ypr;
+    value<bool>    enable_xyz;
     psvr_settings() :
         opts("psvr-tracker"),
         // Default OFF: turning the mirror on is what triggers macOS's
@@ -113,7 +121,9 @@ struct psvr_settings : opts {
         reactivate_interval_s(b, "reactivate-interval-s", 0),
         camera_name(b, "camera-name", {}),
         camera_hfov_deg(b, "camera-hfov-deg", 70.0),
-        camera_hfov_auto(b, "camera-hfov-auto", true)
+        camera_hfov_auto(b, "camera-hfov-auto", true),
+        enable_ypr(b, "enable-ypr", true),
+        enable_xyz(b, "enable-xyz", true)
     {}
 };
 
@@ -551,6 +561,8 @@ private:
     QCheckBox* mirror_box_{nullptr};
     QCheckBox* diag_log_box_{nullptr};
     QCheckBox* camera_box_{nullptr};
+    QCheckBox* ypr_box_{nullptr};
+    QCheckBox* xyz_box_{nullptr};
     QComboBox* camera_name_box_{nullptr};
     // Camera horizontal-FOV spinbox; subordinate to camera_box_.
     // Wired to s_.camera_hfov_deg via tie_setting; value applied to

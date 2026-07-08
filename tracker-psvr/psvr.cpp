@@ -723,10 +723,16 @@ void PSVRTracker::data(double* data)
     } else {
         x = y = z = 0;
     }
+    // Master enables: when a half is switched off, publish zeros for
+    // those channels instead of the tracked value. Read live from the
+    // settings bundle so toggling in the dialog takes effect without a
+    // tracker restart.
+    if (!s_.enable_xyz) { x = y = z = 0; }
+    const bool ypr_on = s_.enable_ypr;
     data[0] = x; data[1] = y; data[2] = z;
-    data[3] = yaw_.load(std::memory_order_relaxed);
-    data[4] = pitch_.load(std::memory_order_relaxed);
-    data[5] = roll_.load(std::memory_order_relaxed);
+    data[3] = ypr_on ? yaw_.load(std::memory_order_relaxed)   : 0;
+    data[4] = ypr_on ? pitch_.load(std::memory_order_relaxed) : 0;
+    data[5] = ypr_on ? roll_.load(std::memory_order_relaxed)  : 0;
 
     using clock = std::chrono::steady_clock;
     static auto last_xyz_log = clock::time_point{};
@@ -1659,6 +1665,20 @@ PSVRDialog::PSVRDialog()
                     "debugging tracking issues."),
         s_.enable_diag_log);
 
+    add_check_with_desc(ypr_box_,
+        QObject::tr("Enable rotation tracking (yaw/pitch/roll)"),
+        QObject::tr("Sends the IMU-derived head rotation to opentrack. "
+                    "Turn off to publish zero rotation (e.g. to source "
+                    "yaw/pitch/roll from another tracker in a Fusion setup)."),
+        s_.enable_ypr);
+
+    add_check_with_desc(xyz_box_,
+        QObject::tr("Enable position tracking (X/Y/Z)"),
+        QObject::tr("Sends the camera-derived head position to opentrack. "
+                    "Turn off to publish zero position. Requires camera "
+                    "tracking below to actually produce a position."),
+        s_.enable_xyz);
+
     add_check_with_desc(camera_box_,
         QObject::tr("Enable camera-based position tracking [experimental]"),
         QObject::tr("Uses the PSVR's built-in blue LEDs and a webcam to "
@@ -1925,6 +1945,8 @@ void PSVRDialog::save()
     if (mirror_box_)   s_.enable_mirror   = mirror_box_->isChecked();
     if (diag_log_box_) s_.enable_diag_log = diag_log_box_->isChecked();
     if (camera_box_)   s_.enable_camera   = camera_box_->isChecked();
+    if (ypr_box_)      s_.enable_ypr      = ypr_box_->isChecked();
+    if (xyz_box_)      s_.enable_xyz      = xyz_box_->isChecked();
     s_.b->save();
 }
 
@@ -1937,6 +1959,8 @@ void PSVRDialog::reload()
     if (mirror_box_)   mirror_box_->setChecked(s_.enable_mirror);
     if (diag_log_box_) diag_log_box_->setChecked(s_.enable_diag_log);
     if (camera_box_)   camera_box_->setChecked(s_.enable_camera);
+    if (ypr_box_)      ypr_box_->setChecked(s_.enable_ypr);
+    if (xyz_box_)      xyz_box_->setChecked(s_.enable_xyz);
 }
 
 OPENTRACK_DECLARE_TRACKER(PSVRTracker, PSVRDialog, PSVRMetadata)
