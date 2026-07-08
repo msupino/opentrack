@@ -3,7 +3,11 @@ include(GetGitRevisionDescription)
 
 find_package(Git QUIET)
 if(GIT_FOUND)
-    git_describe(OPENTRACK_COMMIT --tags --always)
+    # --dirty suffixes "-dirty" when the working tree has uncommitted
+    # changes, so the version baked into the main-window title / About
+    # dialog stays honest for local dev builds. CI runs from a fresh
+    # checkout so the suffix never shows up there.
+    git_describe(OPENTRACK_COMMIT --tags --always --dirty)
 endif()
 
 file(WRITE ${CMAKE_BINARY_DIR}/opentrack-version.hxx "#define OPENTRACK_VERSION \"${OPENTRACK_COMMIT}\"")

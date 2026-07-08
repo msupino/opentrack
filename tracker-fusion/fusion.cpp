@@ -14,6 +14,8 @@
 #include <QDebug>
 #include <QMessageBox>
 #include <QApplication>
+#include <QSplitter>
+#include <QVBoxLayout>
 #include <cassert>
 
 static const char* own_name = "fusion";
@@ -93,29 +95,65 @@ module_status fusion_tracker::start_tracker(QFrame* frame)
     rot_tracker = make_dylib_instance<ITracker>(rot_dylib);
     pos_tracker = make_dylib_instance<ITracker>(pos_dylib);
 
-    status = pos_tracker->start_tracker(frame);
-
-    if (!status.is_ok())
+    // Start the position tracker on a DETACHED probe QFrame first. We
+    // don't yet know whether it installs any UI (camera preview, etc.)
+    // or is a silent tracker (UDP, joystick, ...). If it's silent we
+    // hand the whole `frame` to the rotation tracker, same as the
+    // legacy single-slot behavior. If it DOES install UI, we wrap
+    // both sub-trackers' frames in a vertical QSplitter so both
+    // status widgets - e.g. a camera preview AND PSVR's calibration
+    // banner - are visible at once. Previously the rotation tracker's
+    // UI was forced onto a permanently-hidden QFrame, which made it
+    // impossible to tell what state the rotation tracker was in once
+    // Fusion got involved.
     {
-        err = pos_dylib->name + QStringLiteral(":\n    ") + status.error;
-        goto end;
-    }
-
-    if (frame->layout() == nullptr)
-    {
-        status = rot_tracker->start_tracker(frame);
+        QFrame* pos_probe = new QFrame();
+        pos_probe->setVisible(false);
+        status = pos_tracker->start_tracker(pos_probe);
         if (!status.is_ok())
         {
-            err = rot_dylib->name + QStringLiteral(":\n    ") + status.error;
+            delete pos_probe;
+            err = pos_dylib->name + QStringLiteral(":\n    ") + status.error;
             goto end;
         }
-    }
-    else
-    {
-        other_frame->setFixedSize(320, 240); // XXX magic frame size
-        other_frame->setVisible(false);
 
-        rot_tracker->start_tracker(&*other_frame);
+        if (pos_probe->layout() == nullptr)
+        {
+            // position tracker installed no UI; give rotation tracker
+            // the full preview frame.
+            delete pos_probe;
+            status = rot_tracker->start_tracker(frame);
+            if (!status.is_ok())
+            {
+                err = rot_dylib->name + QStringLiteral(":\n    ") + status.error;
+                goto end;
+            }
+        }
+        else
+        {
+            // Wrap position-tracker UI (pos_probe) + a fresh bottom
+            // frame into a vertical splitter inside `frame`. Stretch
+            // ratio 3:1 gives the camera preview most of the space
+            // while leaving the rotation tracker enough room for a
+            // calibration banner + re-calibrate button.
+            QVBoxLayout* outer   = new QVBoxLayout(frame);
+            QSplitter*   split   = new QSplitter(Qt::Vertical, frame);
+            QFrame*      bottom  = new QFrame();
+            outer->setContentsMargins(0, 0, 0, 0);
+            outer->addWidget(split);
+            split->addWidget(pos_probe);   // reparents into the splitter
+            split->addWidget(bottom);
+            split->setStretchFactor(0, 3);
+            split->setStretchFactor(1, 1);
+            pos_probe->setVisible(true);
+
+            status = rot_tracker->start_tracker(bottom);
+            if (!status.is_ok())
+            {
+                err = rot_dylib->name + QStringLiteral(":\n    ") + status.error;
+                goto end;
+            }
+        }
     }
 
 end:

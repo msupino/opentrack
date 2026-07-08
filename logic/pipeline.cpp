@@ -25,6 +25,8 @@
 #include <algorithm>
 #include <cstdio>
 
+#include <QDebug>
+
 #ifdef _WIN32
 #   include <windows.h>
 #   include <mmsystem.h>
@@ -266,6 +268,39 @@ bool pipeline::maybe_enable_center_on_tracking_started()
     }
 
     return false;
+}
+
+static void log_pipeline_pose_once_per_second(const Pose& tracker,
+                                              const Pose& raw,
+                                              const Pose& mapped,
+                                              const vec6_bool& disabled,
+                                              bool zeroed,
+                                              bool held)
+{
+    static Timer timer;
+    static bool first = true;
+
+    if (!first && timer.elapsed_seconds() < 1)
+        return;
+
+    first = false;
+    timer.start();
+
+    qDebug().nospace().noquote()
+        << "opentrack pipeline: tracker=["
+        << tracker(TX) << ' ' << tracker(TY) << ' ' << tracker(TZ) << ' '
+        << tracker(Yaw) << ' ' << tracker(Pitch) << ' ' << tracker(Roll)
+        << "] raw=["
+        << raw(TX) << ' ' << raw(TY) << ' ' << raw(TZ) << ' '
+        << raw(Yaw) << ' ' << raw(Pitch) << ' ' << raw(Roll)
+        << "] mapped=["
+        << mapped(TX) << ' ' << mapped(TY) << ' ' << mapped(TZ) << ' '
+        << mapped(Yaw) << ' ' << mapped(Pitch) << ' ' << mapped(Roll)
+        << "] disabled=["
+        << disabled(TX) << ' ' << disabled(TY) << ' ' << disabled(TZ) << ' '
+        << disabled(Yaw) << ' ' << disabled(Pitch) << ' ' << disabled(Roll)
+        << "] zero=" << zeroed
+        << " held=" << held;
 }
 
 void pipeline::maybe_set_center_pose(const centering_state mode, const Pose& value, bool own_center_logic)
@@ -529,7 +564,9 @@ ok:
 
     set_center(false);
 
-    if (b.get(f_zero))
+    const bool zero_ordered = b.get(f_zero);
+
+    if (zero_ordered)
         for (int i = 0; i < 6; i++)
             value(i) = 0;
 
@@ -541,6 +578,8 @@ ok:
     for (int i = 0; i < 6; i++)
         if (m(i).opts.invert_post)
             value(i) = -value(i);
+
+    log_pipeline_pose_once_per_second(m_newpose, raw, value, disabled, zero_ordered, hold_ordered);
 
     libs.pProtocol->pose(value, raw);
 
