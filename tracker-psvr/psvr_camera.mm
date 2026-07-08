@@ -170,13 +170,15 @@ static bool frame_duration_for_fps(AVCaptureDeviceFormat* fmt,
     return true;
 }
 
-// Freshness window for publish/consume. Camera runs at ~30 Hz, but the
-// current PSVR constellation solver can accept only every ~1 s while
-// the matcher is being tuned. Hold the last accepted pose long enough
-// to bridge those reject bursts instead of snapping opentrack XYZ back
-// to zero between good camera locks. Still short enough that a real
-// loss of tracking (helmet leaves the frame) falls back to IMU-only
-// promptly.
+// Freshness window for publish/consume. Camera runs at ~30 Hz and the
+// solver is expected to accept at frame rate while locked (the old
+// ~1 Hz accept cadence was a symptom of the frozen-rotation solve and
+// the flat jump gate, both since fixed in psvr_constellation.cpp).
+// This window now only bridges genuine reject bursts - occlusion, a
+// hand in front of the visor, momentary blob dropout - so opentrack
+// XYZ doesn't snap back to zero between locks. Still short enough
+// that a real loss of tracking (helmet leaves the frame) falls back
+// to IMU-only promptly.
 static constexpr double RESULT_STALE_SEC = 2.0;
 
 // Periodic [psvr-cam] stderr summary cadence (frames). At ~30 Hz this
@@ -296,6 +298,24 @@ static constexpr int BRIGHT_THRESH_CEIL  = 250;
 // vs the old 5/40 = 12%.
 static constexpr int N_TARGET_BRIGHT_PIXELS = 40;
 
+// Blue-dominance rescue threshold, applied to (B - max(R, G)) on the
+// 8-bit BGR frame. The adaptive grayscale threshold above has a hard
+// failure mode: anything in frame BRIGHTER than the LED cores (sunlit
+// wall, window, monitor, lamp) contributes >= N_TARGET_BRIGHT_PIXELS
+// of near-255 pixels, pins the threshold at BRIGHT_THRESH_CEIL, and
+// the (dimmer) LED cores fall below it - blobs vanish and the solver
+// never locks. The PSVR LEDs are strongly BLUE while those interferers
+// are white-ish (B ~= max(R,G), dominance ~ 0), so a parallel mask
+// keyed on blue dominance re-admits the LEDs no matter how bright the
+// background is. The two masks are OR-ed: brightness catches LED cores
+// that bloom to white (B=G=R=255, dominance 0), blue-dominance catches
+// the saturated blue halo when the core loses the brightness race.
+// 64 sits well above webcam AWB noise on white/grey scenes (< ~20)
+// and below a typical LED halo (B >= 200, G <= 80, R <= 40 -> >= 120).
+// Blue scene content that clears it (sky, blue wallpaper) yields big
+// or non-circular contours that the area/circularity gates drop.
+static constexpr int BLUE_DOMINANCE_THRESH = 64;
+
 // Pick a brightness threshold by walking the histogram from V=255
 // down until cumulative pixel count reaches N_TARGET_BRIGHT_PIXELS.
 // Result is clamped to [FLOOR, CEIL]. O(W*H) for the histogram +
@@ -411,8 +431,16 @@ struct Worker::Impl {
     AVCaptureVideoDataOutput*  output{nil};
     dispatch_queue_t           queue{nullptr};
     PSVRCaptureDelegate*       delegate{nil};
+    // NSNotificationCenter token for the AVCaptureSessionRuntimeError
+    // observer registered in start() (TCC denial, device unplug,
+    // media-services reset). Removed in stop().
+    id                         runtime_err_observer{nil};
 
     std::atomic<bool> running{false};
+
+    // One-shot latch for the width-based OV580 auto-HFOV correction in
+    // process_frame (see there). Touched only on the capture queue.
+    bool ov580_hfov_checked{false};
 
     // Atomic rotation prior published by the HID thread.
     std::atomic<double> yaw_rad{0}, pitch_rad{0}, roll_rad{0};
@@ -431,10 +459,16 @@ struct Worker::Impl {
     // common case for the reader. Previous design with separate
     // relaxed atomics could let a reader see x from frame N+1 and y/z
     // from frame N - actual write tearing.
+    // The payload fields are std::atomic with RELAXED accesses (the
+    // seq bracket + fences provide the ordering): plain doubles under
+    // a seqlock are still a formal C++ data race, and the reader also
+    // needs an acquire fence BEFORE the validating re-read of pos_seq
+    // or the payload loads may be reordered past it. See Boehm, "Can
+    // seqlocks get along with programming language memory models?".
     std::atomic<uint64_t> pos_seq{0};
-    double                pos_x_cm{0}, pos_y_cm{0}, pos_z_cm{0};
-    double                result_epoch{0};      // monotonic wall time
-    bool                  pnp_ok_latest{false};
+    std::atomic<double>   pos_x_cm{0}, pos_y_cm{0}, pos_z_cm{0};
+    std::atomic<double>   result_epoch{0};      // monotonic wall time
+    std::atomic<bool>     pnp_ok_latest{false};
 
     // Diag counters, guarded by a mutex only during bulk copy.
     mutable std::mutex diag_mu;
@@ -532,11 +566,14 @@ bool Worker::get_position(double* x, double* y, double* z) const {
     for (int tries = 0; tries < 8; ++tries) {
         const uint64_t s1 = impl_->pos_seq.load(std::memory_order_acquire);
         if (s1 & 1u) continue;          // mid-write
-        const double  epoch  = impl_->result_epoch;
-        const double  x_v    = impl_->pos_x_cm;
-        const double  y_v    = impl_->pos_y_cm;
-        const double  z_v    = impl_->pos_z_cm;
-        const uint64_t s2 = impl_->pos_seq.load(std::memory_order_acquire);
+        const double  epoch  = impl_->result_epoch.load(std::memory_order_relaxed);
+        const double  x_v    = impl_->pos_x_cm.load(std::memory_order_relaxed);
+        const double  y_v    = impl_->pos_y_cm.load(std::memory_order_relaxed);
+        const double  z_v    = impl_->pos_z_cm.load(std::memory_order_relaxed);
+        // Fence BEFORE the validating re-read: without it the payload
+        // loads above may sink past s2 and the tear check is unsound.
+        std::atomic_thread_fence(std::memory_order_acquire);
+        const uint64_t s2 = impl_->pos_seq.load(std::memory_order_relaxed);
         if (s1 != s2) continue;         // writer ran during our read
         if (epoch == 0.0) return false;
         if (now_sec() - epoch > RESULT_STALE_SEC) return false;
@@ -864,6 +901,30 @@ bool Worker::start() {
         impl_->queue    = q;
         impl_->delegate = del;
 
+        // Runtime-error watchdog. TCC permission denial, device unplug
+        // mid-session, and media-services resets all surface as
+        // AVCaptureSessionRuntimeErrorNotification. Flip `running`
+        // false so is_running()/get_position() consumers fall back to
+        // IMU-only instead of holding the last position against a dead
+        // camera forever. (The permissions note at the top of this
+        // file promised this observer; it previously didn't exist.)
+        // The block captures the raw Impl*, which outlives the
+        // observer: stop() removes the observer before ~Worker
+        // destroys the Impl.
+        Worker::Impl* impl_raw = impl_.get();
+        impl_->runtime_err_observer =
+            [[NSNotificationCenter defaultCenter]
+                addObserverForName:AVCaptureSessionRuntimeErrorNotification
+                            object:session
+                             queue:nil
+                        usingBlock:^(NSNotification* note) {
+                NSError* e = note.userInfo[AVCaptureSessionErrorKey];
+                std::fprintf(stderr,
+                    "[psvr-cam] capture session runtime error: %s\n",
+                    e ? e.localizedDescription.UTF8String : "unknown");
+                impl_raw->running.store(false);
+            }];
+
         [session startRunning];
         impl_->running.store(true);
         std::fprintf(stderr, "[psvr-cam] camera started: %s (%s)\n",
@@ -874,8 +935,17 @@ bool Worker::start() {
 }
 
 void Worker::stop() {
-    if (!impl_->running.load()) return;
+    // No early-return on !running: the runtime-error observer flips
+    // `running` false on a dead session, and the old guard then
+    // skipped the actual teardown (session, observer, delegate) -
+    // leaking them until process exit. Every step below is nil-guarded
+    // and idempotent, so calling stop() twice is harmless.
     @autoreleasepool {
+        if (impl_->runtime_err_observer) {
+            [[NSNotificationCenter defaultCenter]
+                removeObserver:impl_->runtime_err_observer];
+            impl_->runtime_err_observer = nil;
+        }
         if (impl_->session) {
             [impl_->session stopRunning];
             impl_->session = nil;
@@ -946,6 +1016,27 @@ static void process_frame(Worker::Impl* s, CVPixelBufferRef buf) {
                 w, h, eye_w, eye_h, w * 2);
             announced = true;
         }
+        // Width-based auto-HFOV correction. start()'s auto-HFOV keys
+        // off the device's localizedName; an OV580 that enumerates
+        // under an unexpected name falls back to the generic 70 deg -
+        // an ~18% focal error that scales the solved Z (and X/Y) off
+        // by the same factor. The 898/1748/3448 raw widths reaching
+        // this branch are conclusive OV580 evidence, so correct the
+        // auto HFOV here once per session.
+        if (!s->ov580_hfov_checked) {
+            s->ov580_hfov_checked = true;
+            if (s->desired_hfov_auto.load(std::memory_order_relaxed)) {
+                const double cur =
+                    s->desired_hfov_deg.load(std::memory_order_relaxed);
+                if (std::abs(cur - 85.0) > 0.5) {
+                    s->desired_hfov_deg.store(85.0,
+                                              std::memory_order_relaxed);
+                    std::fprintf(stderr,
+                        "[psvr-cam] OV580 detected by frame width; "
+                        "auto HFOV %.1f -> 85.0 deg\n", cur);
+                }
+            }
+        }
         // CRITICAL: the OV580 image data is packed CONTIGUOUSLY at
         // w*2 bytes per row (3496 for the 1748-wide mode), NOT at the
         // stride CVPixelBufferGetBytesPerRow() reports (3520). The
@@ -969,9 +1060,14 @@ static void process_frame(Worker::Impl* s, CVPixelBufferRef buf) {
         }
         cv::cvtColor(left, s->bgr_owned, cv::COLOR_YUV2BGR_YUYV);
     } else {
-        // Ordinary webcam delivering plain packed YUYV. Decode at the
-        // true memory width (stride/2) so SIMD row alignment is correct.
-        cv::Mat yuyv(h, stride / 2, CV_8UC2, base, stride);
+        // Ordinary webcam delivering plain packed YUYV. Wrap at the
+        // TRUE image width and pass the reported stride as the row
+        // step - OpenCV walks padded rows correctly via step. The
+        // previous stride/2-wide wrap baked any row padding into the
+        // image as garbage right-edge columns AND shifted the pinhole
+        // principal point (cx became stride/4, not w/2), silently
+        // corrupting the PnP intrinsics on cameras that pad rows.
+        cv::Mat yuyv(h, w, CV_8UC2, base, (size_t)stride);
         cv::cvtColor(yuyv, s->bgr_owned, cv::COLOR_YUV2BGR_YUYV);
     }
 
@@ -1009,6 +1105,20 @@ static void process_frame(Worker::Impl* s, CVPixelBufferRef buf) {
     cv::cvtColor(s->bgr_owned, s->gray, cv::COLOR_BGR2GRAY);
     const int bright_thresh = adaptive_bright_threshold(s->gray);
     cv::threshold(s->gray, s->mask, bright_thresh, 255, cv::THRESH_BINARY);
+
+    // Blue-dominance rescue mask, OR-ed in (see BLUE_DOMINANCE_THRESH).
+    // Keeps the LEDs detectable when a brighter white-ish object in
+    // frame pins the adaptive threshold above the LED cores.
+    {
+        cv::Mat ch[3];
+        cv::split(s->bgr_owned, ch);            // BGR order: ch[0] = B
+        cv::Mat maxrg, bdom, blue_mask;
+        cv::max(ch[2], ch[1], maxrg);           // max(R, G)
+        cv::subtract(ch[0], maxrg, bdom);       // CV_8U: saturates at 0
+        cv::threshold(bdom, blue_mask, BLUE_DOMINANCE_THRESH, 255,
+                      cv::THRESH_BINARY);
+        cv::bitwise_or(s->mask, blue_mask, s->mask);
+    }
 
     // Field-tuned: switched from MORPH_OPEN(2x2) to MORPH_DILATE(3x3).
     // Open (erode-then-dilate) was eating the 1-2 pixel LED cores -
@@ -1179,24 +1289,26 @@ static void process_frame(Worker::Impl* s, CVPixelBufferRef buf) {
     // acq_rel ordering on the bracket pins the data writes between
     // them as far as other threads are concerned.
     if (r.ok) {
-        s->pos_seq.fetch_add(1, std::memory_order_acq_rel);
-        s->pos_x_cm        = r.x_cm;
-        s->pos_y_cm        = r.y_cm;
-        s->pos_z_cm        = r.z_cm;
-        s->pnp_ok_latest   = true;
-        s->result_epoch    = now_sec();
-        s->pos_seq.fetch_add(1, std::memory_order_acq_rel);
+        s->pos_seq.fetch_add(1, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
+        s->pos_x_cm.store(r.x_cm, std::memory_order_relaxed);
+        s->pos_y_cm.store(r.y_cm, std::memory_order_relaxed);
+        s->pos_z_cm.store(r.z_cm, std::memory_order_relaxed);
+        s->pnp_ok_latest.store(true, std::memory_order_relaxed);
+        s->result_epoch.store(now_sec(), std::memory_order_relaxed);
+        s->pos_seq.fetch_add(1, std::memory_order_release);
     } else {
         // Failure path: only the pnp_ok flag changes. Same seqlock
         // bracket so a concurrent reader either sees the previous
         // good (ok=true) state or the new (ok=false) state, never
         // ok=false with stale-but-still-fresh-epoch x/y/z.
-        s->pos_seq.fetch_add(1, std::memory_order_acq_rel);
-        s->pnp_ok_latest = false;
+        s->pos_seq.fetch_add(1, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
+        s->pnp_ok_latest.store(false, std::memory_order_relaxed);
         // Intentionally do NOT bump result_epoch or zero x/y/z:
         // last-good values stay around for any caller that wants a
         // "last known" snapshot for logging.
-        s->pos_seq.fetch_add(1, std::memory_order_acq_rel);
+        s->pos_seq.fetch_add(1, std::memory_order_release);
     }
 
     // Diag bookkeeping (protected by a lightweight mutex only during
