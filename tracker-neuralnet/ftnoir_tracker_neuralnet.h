@@ -29,6 +29,7 @@
 
 #include <array>
 #include <cinttypes>
+#include <limits>
 #include <memory>
 
 #include <opencv2/core.hpp>
@@ -62,8 +63,9 @@ struct resolution_tuple
     int height;
 };
 
-static const std::array<resolution_tuple, 9> resolution_choices = { {
+static const std::array<resolution_tuple, 10> resolution_choices = { {
     { 320, 240 },
+    { 640, 400 },
     { 640, 480 },
     { 800, 600 },
     { 1024, 768 },
@@ -76,7 +78,7 @@ static const std::array<resolution_tuple, 9> resolution_choices = { {
 
 struct Settings : opts
 {
-    value<int> offset_fwd{ b, "offset-fwd", 200 }, // Millimeters
+    value<int> offset_fwd{ b, "offset-fwd", -100 }, // Millimeters
         offset_up{ b, "offset-up", 0 }, offset_right{ b, "offset-right", 0 };
     value<QString> camera_name{ b, "camera-name", "" };
     value<int> fov{ b, "field-of-view", 56 };
@@ -85,11 +87,11 @@ struct Settings : opts
     value<double> roi_filter_alpha{ b, "roi-filter-alpha", 1. };
     value<double> roi_zoom{ b, "roi-zoom", 1. };
     value<bool> use_mjpeg{ b, "use-mjpeg", false };
-    value<int> num_threads{ b, "num-threads", 1 };
+    value<int> num_threads{ b, "num-threads", 2 };
     value<int> resolution{ b, "force-resolution", 0 };
     value<double> deadzone_size{ b, "deadzone-size", 1. };
     value<double> deadzone_hardness{ b, "deadzone-hardness", 1.5 };
-    value<QString> posenet_file{ b, "posenet-file", "head-pose-0.4-big-int8.onnx" };
+    value<QString> posenet_file{ b, "posenet-file", "head-pose-0.5-small.onnx" };
     value<bool> internal_filter_enabled{ b, "internal-filter-enabled", true };
     Settings();
 };
@@ -101,6 +103,36 @@ struct CamIntrinsics
     float fov_w;
     float fov_h;
 };
+
+
+class ImagePyramid
+{
+public:
+    // Stores the image as finest level using ref counting.
+    // Then fills the pyramid levels. Only allocates on successive calls when image size changes.
+    // Also generates greyscale versions.
+    void init(const cv::Mat& image);
+    const cv::Mat& image(int level=0) const { return images_[level]; }
+    const cv::Mat& greyscale(int level=0) const { return greyscale_[level]; }
+    const cv::Mat& coarsest_greyscale() const { return greyscale_[depth_-1]; }
+    const cv::Mat& coarsest_image() const { return images_[depth_-1]; }
+    int depth() const { return depth_; }
+    static constexpr int max_levels = 4;
+private:
+    std::array<cv::Mat, static_cast<std::size_t>(max_levels)> images_ = {}; // Image pyramid
+    std::array<cv::Mat, static_cast<std::size_t>(max_levels)> greyscale_ = {};
+    int depth_ = 0;
+};
+
+
+// Tries to find a pyramid level for the "desired_roi_with".
+// Given "current_roi_width" on the "current_level" getting the same crop on a coarser or finer level
+// decreases or increases the resolution respectively. Thus this function figures out a level which
+// matches the desired resolution, returning the level with the smallest resolution which is still higher than
+// the desired one.
+// Return scaling factor and desired level.
+std::tuple<float, int> get_matching_level(const ImagePyramid& pyramid, int current_level, float current_roi_width, float desired_roi_width);
+
 
 class NeuralNetTracker : protected virtual QThread, public ITracker
 {
@@ -120,8 +152,7 @@ public:
 private:
     bool detect();
     bool open_camera();
-    void set_intrinsics();
-    cv::Mat prepare_input_image(const video::frame& frame);
+    void copy_frame(const video::frame& frame, cv::Mat& dest) const;
     static void maybe_load_onnxruntime_dynamically();
     bool load_and_initialize_model();
     void draw_gizmos(const std::optional<PoseEstimator::Face>& face, const Affine& pose);
@@ -142,9 +173,10 @@ private:
     std::optional<Localizer> localizer_;
     std::optional<PoseEstimator> poseestimator_;
 
-    CamIntrinsics intrinsics_{};
-    cv::Mat grayscale_;
-    std::array<cv::Mat, 2> downsized_original_images_ = {}; // Image pyramid
+    cv::Mat frame_copy_ = {};
+    ImagePyramid pyramid_ = {};
+    CamIntrinsics intrinsics_ = {};
+
     std::optional<cv::Rect2f> last_localizer_roi_;
     std::optional<cv::Rect2f> last_roi_;
     static constexpr float HEAD_SIZE_MM = 200.f; // In the vertical. Approximately.
@@ -161,6 +193,7 @@ private:
     QMutex mtx_ = {}; // Protects the pose
     std::optional<QuatPose> last_pose_ = {};
     Affine last_pose_affine_ = {};
+    bool tracking_valid_ = false;
 
     Preview preview_;
     std::unique_ptr<cv_video_widget> video_widget_;
