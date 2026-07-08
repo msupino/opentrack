@@ -1,7 +1,7 @@
 # opentrack — architecture overview
 
 High-level map of this opentrack fork for contributors and agents.
-Build/run details live in the Cursor skills under `.cursor/skills/`
+Build/run details live in the AI-maintained skills under `.ai/skills/`
 (`opentrack-build`, `opentrack-osx-issues`, `opentrack-psvr-issues`).
 
 ## What opentrack is
@@ -58,7 +58,10 @@ PlayStation VR head tracker, macOS-native. Two pose sources fused:
   the PS4 Camera (OV580). The plugin embeds + uploads the PS4 Camera
   firmware (libusb) so it appears as a UVC webcam.
 
-Output: `data[0..2]` = X/Y/Z (cm/mm), `data[3..5]` = yaw/pitch/roll.
+Output: `data[0..2]` = X/Y/Z in centimeters relative to the tracker-local
+camera origin, `data[3..5]` = yaw/pitch/roll in degrees. User-visible
+rotation stays IMU-driven; the camera's internal PnP rotation is only an
+optical prior for the next frame.
 
 ## Sibling repos (not part of this build)
 
@@ -69,16 +72,18 @@ Output: `data[0..2]` = X/Y/Z (cm/mm), `data[3..5]` = yaw/pitch/roll.
 
 ## Build & run
 
-See `.cursor/skills/opentrack-build/SKILL.md`. TL;DR:
+See `.ai/skills/opentrack-build/SKILL.md`. TL;DR:
 - First build: `cmake -S . -B build -DCMAKE_BUILD_TYPE=RELEASE
   -DCMAKE_INSTALL_PREFIX="$PWD/install"` → `cmake --build build` →
   `cmake --install build`.
 - Dev inner loop: `dev/hot-install.sh tracker-psvr`.
+- CLI auto-start for hardware tests: `open install/opentrack.app --args --start`
+  (or `--start-tracking`).
 - Full distributable: `cmake --install build` + `macosx/make-app-bundle.sh`.
 
 ## macOS pitfalls
 
-See `.cursor/skills/opentrack-osx-issues/SKILL.md` — the short list:
+See `.ai/skills/opentrack-osx-issues/SKILL.md` — the short list:
 double-Qt from un-fixed rpaths, `presets/README.txt` codesign trap,
 re-sign after `install_name_tool`, AVFoundation (not Qt) for camera
 enumeration, TCC permissions, and the PS4 Camera USB-3.0 requirement.

@@ -6,9 +6,9 @@ description: >-
   ITrackerDialog embedding hooks that let PSVRDialog work as both a standalone
   window and an Options-dialog tab, the calibration state machine and its
   USB-unplug failure mode, the gated constellation/PnP diagnostic logging,
-  the experimental ini-configurable HID keepalive (delays auto-sleep by
-  ~2 minutes), and PSVR hardware quirks (HDMI passthrough, processor-unit
-  cold-boot timing). Use when the user mentions PSVR, PlayStation VR, the
+  the optional PS4 Camera/OV580 positional tracker, the experimental
+  ini-configurable HID keepalive, and PSVR hardware quirks (HDMI passthrough,
+  processor-unit cold-boot timing). Use when the user mentions PSVR, PlayStation VR, the
   PSVR helmet, head tracker, tracker-psvr, psvr.cpp, the constellation tracker,
   recalibration, the HID keepalive, the PSVR control box, headset auto-sleep,
   or the Options-dialog "Tracker" tab.
@@ -79,33 +79,34 @@ Don't re-introduce a code path where recalibration depends on the
 ## Diagnostic logging is opt-in
 
 The constellation tracker's per-frame PnP solve produces a lot of
-detail. Logging it on every frame at 60 fps drowns the console and
-makes real warnings unreadable.
+detail. Logging it on every frame drowns the console and makes real
+warnings unreadable.
 
 Per-frame logs are **gated** on the `enable-diag-log` setting in the
-plugin's ini. Add a conditional, e.g.:
-
-```cpp
-if (s.enable_diag_log)
-    qDebug() << "constellation:" << ...;
-```
-
-Don't add unconditional `qDebug()` calls in any per-frame path.
+plugin's ini or on the `PSVR_CONSTELLATION_LOG` environment variable.
+`enable-diag-log` bridges to `/tmp/psvr-constellation.log` at tracker
+start; setting the env var directly lets you choose another path. The
+per-second `[psvr-cam]` summaries go to stderr and are okay; don't add
+unconditional `qDebug()` calls in any per-frame path.
 
 ## HID keepalive — experimental, opt-in
 
 PSVR firmware auto-sleeps the headset after a period of HID inactivity.
-A periodic HID write **delays** auto-sleep — but only by about
-2 minutes total, not indefinitely. That's a firmware quirk, not a code
-bug.
+A lightweight periodic HID write is available, but it is still
+experimental because some command bytes interrupt the IMU stream.
 
 The keepalive is:
 
 - **Configurable from the ini**, not the GUI (deliberately
   experimental).
 - **Off by default**.
-- Worth mentioning if a user reports the headset sleeping mid-session
-  — but don't promise it'll keep the headset awake forever.
+- Default probe is `keepalive-cmd=0x17`, `keepalive-interval-s=60`.
+  `0x17` sends `SetHeadsetPower(ON)` only; it is much lighter than the
+  full activation burst.
+- The old 10 s full-burst keepalive (`0x17` + `0x11`) caused visible
+  1-2 s IMU stalls every time it fired. Do not bring that behavior back.
+- If the HID stream goes silent after calibration, the watchdog still
+  fires the full activation burst as a recovery path.
 
 ## Hardware quirks
 
@@ -113,7 +114,7 @@ The keepalive is:
 |---|---|
 | PSVR control box HDMI passthrough is off when the box is off | If they see "no image" on the headset, suggest bypassing the box and plugging HDMI directly into the helmet to isolate whether the box is the issue. |
 | Processor-unit cold-boot handshake takes 5–15 s after Start | The watchdog should not surface an error until ~25 s. Premature error banners confuse users into unplugging while the box is still negotiating. |
-| Auto-sleep mid-session | See HID keepalive above. Even with it on, max delay is ~2 min. |
+| Auto-sleep mid-session | See HID keepalive above. Use `/tmp/psvr-diag.log` to confirm whether reports stopped and whether keepalive commands were accepted. |
 
 ## PS4 Camera (OV580) — camera-based positional tracking
 
@@ -141,14 +142,47 @@ it (blue-tuned IR-cut filter). Key facts:
   1748×408 mode). Decoding at the reported stride/width shears the image
   diagonally. We use the left lens only (monocular PnP); stereo is a
   possible future upgrade.
+- **Frame rate.** Default is the stable AVFoundation-negotiated cadence
+  (observed as 1748×408 at ~30 fps). `PSVR_CAM_FPS=60` can force a
+  faster OV580 mode for experiments, using AVFoundation's exact
+  advertised `CMTime` duration. In testing it started cleanly but the
+  stream went stale after a few frames, so keep it opt-in.
 - **HFOV** auto-selects by camera (OV580 = 85°); manual override in the
   dialog.
-- **Pose solve.** With sparse near-coplanar front LEDs, monocular PnP
-  has a two-fold ambiguity → position jumps. The fix in place: lock
-  rotation to the IMU and solve translation only (damped Gauss-Newton),
-  falling back to free-rotation PnP when the IMU isn't streaming.
+- **Pose solve.** User-visible yaw/pitch/roll always comes from the
+  PSVR IMU. The camera solver is free-pose PnP internally, but its rvec
+  is used only as the optical prior for the next frame. The current
+  stability stack is:
+  - project the 9-LED model from the last accepted camera pose;
+  - greedily match projected visible LEDs to blobs one-to-one;
+  - if prior matching gives enough inliers, run direct iterative
+    `solvePnP` seeded from the prior;
+  - otherwise fall back to sampled AP3P correspondence search and
+    `solvePnPRansac`;
+  - reject with RMS, Z-range, cm/jump, and internal camera-rvec jump
+    gates (`ROT_JUMP`) so mirror/twin PnP branches don't become visible
+    XYZ jumps.
+- **Cold first lock.** A 4-LED first lock must be stable for several
+  close frames before publishing; otherwise `TENTATIVE_FIRST_LOCK` /
+  `WEAK_FIRST_LOCK` protects against latching a one-frame false pose.
 - **Tracking diagnostics.** The worker logs `[psvr-cam] frames=… blobs=…
   vis=… matched=… pnp=… reject=… ypr=[…] pos=[…]` to stderr (~1/s) plus
-  one-shot frame dumps for debugging. Run opentrack with stderr captured
-  (see opentrack-build skill) to see them. A dark room dramatically cuts
-  noise blobs.
+  optional per-frame constellation lines to `/tmp/psvr-constellation.log`
+  when `enable-diag-log` is on or `PSVR_CONSTELLATION_LOG` is set.
+  Frame/image dumps are off by default; set `PSVR_CAM_DUMP_FRAMES=1` to
+  write `/tmp/psvr-frame.pgm` and `/tmp/psvr-preview.ppm`. Run opentrack
+  with stderr captured (see opentrack-build skill) to see the summaries.
+  A dark room dramatically cuts noise blobs.
+
+## Current known-good PSVR tracking profile
+
+Last validated on this branch with a PS4 Camera OV580:
+
+- Active camera format: `1748x408 yuvs`, de-interleaved to left-eye
+  `640x400`.
+- Default cadence: ~30 fps.
+- Stable lock: `pnp_ok` close to total frame count (example:
+  `837/840`), four or five LED matches, RMS around 1-2 px when the
+  headset is still and LEDs are clean.
+- If XYZ feels slow after those numbers are good, suspect camera frame
+  rate or opentrack filter/mapping smoothing rather than the PnP solve.

@@ -37,7 +37,7 @@ done
 Verify with:
 
 ```bash
-otool -l install/opentrack.app/Contents/MacOS/Plugins/libopentrack-tracker-psvr.dylib | grep -A2 LC_RPATH
+otool -l install/opentrack.app/Contents/MacOS/Plugins/opentrack-tracker-psvr.dylib | grep -A2 LC_RPATH
 ```
 
 ## `presets/README.txt` codesign trap
@@ -54,18 +54,33 @@ modified `.dylib` and the main exe after editing.
 
 ## Camera enumeration: AVFoundation, not Qt
 
-`tracker-psvr/psvr_camera.mm` enumerates webcams via AVFoundation, not
-Qt. Reason:
+`tracker-psvr/psvr_camera.mm` enumerates and captures webcams via
+AVFoundation, not Qt. Reason:
 
-- `QCameraInfo::availableCameras()` returns devices in an order that
-  **doesn't match** `cv::VideoCapture`'s integer device indices on
-  macOS. User picks "PSVR camera" in the combobox; OpenCV opens the
-  FaceTime camera.
-- AVFoundation's `AVCaptureDeviceDiscoverySession` sorted by
-  `uniqueID` produces a stable ordering that `cv::VideoCapture(i)`
-  agrees with.
+- `QCameraInfo::availableCameras()` misses or mislabels some external
+  USB cameras on macOS, especially around newer external-device APIs.
+- `AVCaptureDeviceDiscoverySession` can include built-in, external,
+  external-unknown, and Desk View camera types and gives stable
+  `localizedName` + `uniqueID` values for settings.
+- PS4 Camera support needs direct `AVCaptureDeviceFormat` selection,
+  exact frame-duration handling, and native `yuvs` buffers; that belongs
+  in the AVFoundation worker, not through Qt camera abstractions.
 
 Do not regress to Qt enumeration on macOS.
+
+## AVFoundation frame-rate exactness
+
+Some UVC devices advertise friendly rates like `60.00 fps` but reject a
+synthesized `CMTimeMake(1, 60)` with:
+
+```text
+setActiveVideoMinFrameDuration: Not supported
+```
+
+If forcing frame rate, pick the matching `AVFrameRateRange` and use its
+exact `minFrameDuration` / `maxFrameDuration`. This matters for the
+PS4 Camera OV580: the experimental `PSVR_CAM_FPS=60` path must use the
+duration object AVFoundation reports, not a rounded value.
 
 ## TCC permissions
 

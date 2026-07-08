@@ -67,6 +67,7 @@ bundle → re-sign → relaunch in a few seconds.
 dev/hot-install.sh                          # default: tracker-psvr proto-wine
 dev/hot-install.sh tracker-psvr             # one target
 dev/hot-install.sh --exe [targets...]       # also reinstall opentrack.app binary
+                                             # and opentrack-logic.dylib
 dev/hot-install.sh --no-launch              # skip the final `open`
 ```
 
@@ -115,11 +116,28 @@ codesign --force --deep --sign - install/opentrack.app && killall Dock
 ```bash
 open install/opentrack.app                 # normal
 
-# stderr-capturing launch (REQUIRED to see plugin diagnostics like the
-# PSVR [psvr-cam] logs — Finder/`open` sends stderr to /dev/null):
+# stderr-capturing launch (REQUIRED to see plugin diagnostics like
+# PSVR [psvr-cam] logs). --start begins tracking as soon as the main
+# window is ready.
 pkill -x opentrack
-nohup install/opentrack.app/Contents/MacOS/opentrack >/tmp/opentrack.log 2>&1 &
+: > /tmp/opentrack.stdout.log
+: > /tmp/opentrack.stderr.log
+open -n \
+  --stdout /tmp/opentrack.stdout.log \
+  --stderr /tmp/opentrack.stderr.log \
+  install/opentrack.app \
+  --args --start
+
+# PSVR constellation per-frame log, when enabled for debugging:
+open -n \
+  --stdout /tmp/opentrack.stdout.log \
+  --stderr /tmp/opentrack.stderr.log \
+  --env PSVR_CONSTELLATION_LOG=/tmp/psvr-constellation.log \
+  install/opentrack.app \
+  --args --start
 ```
+
+`--start-tracking` is accepted as an alias for `--start`.
 
 macOS permissions (System Settings → Privacy & Security), toggle
 off/on if stale after a rebuild:
@@ -148,10 +166,10 @@ dev/hot-install.sh tracker-psvr
 dev/hot-install.sh --exe tracker-psvr
 
 # inspect a plugin dylib's actual link paths (debug double-Qt issues)
-otool -L install/opentrack.app/Contents/MacOS/Plugins/libopentrack-tracker-psvr.dylib
+otool -L install/opentrack.app/Contents/MacOS/Plugins/opentrack-tracker-psvr.dylib
 
 # verify rpaths are clean post-deploy
-otool -l install/opentrack.app/Contents/MacOS/Plugins/libopentrack-tracker-psvr.dylib | grep -A2 LC_RPATH
+otool -l install/opentrack.app/Contents/MacOS/Plugins/opentrack-tracker-psvr.dylib | grep -A2 LC_RPATH
 ```
 
 ## Translations: `lang/*.ts` files
