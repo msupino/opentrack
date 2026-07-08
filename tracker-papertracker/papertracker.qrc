@@ -1,0 +1,10 @@
+<RCC>
+    <qresource prefix="/">
+        <file>images/papertracker.png</file>
+        <file>images/markers-single.png</file>
+        <file>images/markers-centered.png</file>
+        <file>images/markers-offset.png</file>
+        <file>images/markers-angled.png</file>
+        <file>html/papertracker-help.html</file>
+    </qresource>
+</RCC>
