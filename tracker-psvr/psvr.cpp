@@ -99,12 +99,22 @@ double accel_roll_deg(const double a[3])
 
 uint8_t control_report_unknown_byte(uint8_t cmd)
 {
-    // The reverse-engineered protocol docs describe this header byte as
-    // "unknown, 0 seems to always work". OpenHMD's raw hid_write packet
-    // uses 0x76 for 0x17, but macOS IOHIDDeviceSetReport rejects that
-    // variant on this device path, so keep the IOKit sender on 0.
-    (void)cmd;
-    return 0x00;
+    // Byte 1 of the PSVR control report ("CommandStatus"/magic). Per
+    // OpenHMD's drv_psvr (known-working on macOS via hidapi hid_write)
+    // this byte is command-specific, NOT always 0:
+    //   0x17 SetHeadsetPower -> 0x76
+    //   0x11 EnableTracking  -> 0x00
+    //   0x23 SetVRMode       -> 0x00
+    // A previous revision hard-coded 0x00 for all commands, believing
+    // "macOS SetReport rejects 0x76". That was a misdiagnosis: 0x76
+    // errors only on the SENSOR interface (which send_activation_to_all
+    // also blindly writes to), while the CONTROL interface requires it -
+    // and hidapi/OpenHMD send exactly this byte on macOS successfully.
+    // With byte1=0 the 0x17 power-on is silently ineffective, so the
+    // headset display + blue tracking LEDs never come on and optical XYZ
+    // has nothing to see. Restoring 0x76 for 0x17 is what actually
+    // lights the headset.
+    return (cmd == 0x17) ? 0x76 : 0x00;
 }
 
 const uint8_t* keepalive_payload_for_cmd(uint8_t cmd,

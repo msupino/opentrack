@@ -68,7 +68,10 @@ static int send_cmd(IOHIDDeviceRef device, uint8_t cmd,
 {
     uint8_t report[64] = {0};
     report[0] = cmd;
-    report[1] = 0x00;   /* "unknown, 0 always works" header byte */
+    /* Byte 1 is command-specific per OpenHMD drv_psvr (known-working on
+     * macOS): 0x17 SetHeadsetPower needs 0x76, others 0x00. With 0x00
+     * the power-on is silently ineffective and the headset never lights. */
+    report[1] = (cmd == 0x17) ? 0x76 : 0x00;
     report[2] = 0xAA;
     report[3] = (uint8_t)len;
     if (payload && len > 0) memcpy(report + 4, payload, len);
