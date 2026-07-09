@@ -256,6 +256,14 @@ static constexpr double BLOB_MAX_AREA_PX = 1500.0;
 // 0.45 leaves headroom for that without re-admitting the slats.
 static constexpr double BLOB_MIN_CIRCULARITY = 0.45;
 
+// Max blobs handed to the constellation solver. The PSVR has 9 LEDs and
+// at most 5-7 are visible at once, so 16 leaves generous headroom for a
+// few spurious bright spots while bounding the solver's permutation-
+// RANSAC combinatorics. Blobs beyond the 16 brightest are dropped
+// (see the brightness sort in process_frame). Matches tracker-pt's
+// max_blobs cap.
+static constexpr int BLOB_POOL_MAX = 16;
+
 // Grayscale brightness threshold for the bright-blob mask is now
 // chosen ADAPTIVELY per frame from the gray histogram (see
 // adaptive_bright_threshold below). The principle: PSVR LEDs are
@@ -1201,8 +1209,19 @@ static void process_frame(Worker::Impl* s, CVPixelBufferRef buf) {
     // path. Net per-frame cost is comparable to or slightly cheaper
     // than the old two-mask HSV path, since BGR2GRAY+threshold is
     // strictly faster than BGR2HSV+inRange+inRange+bitwise_or.
-    std::vector<cv::Point2d> blobs;
-    blobs.reserve(contours.size());
+    // Collect candidate blobs with an integrated-brightness score, then
+    // keep only the BLOB_POOL_MAX brightest (tracker-pt does the same:
+    // point_extractor.cpp sorts by brightness and caps max_blobs=16).
+    // Rationale for the PSVR case: the real LEDs are the brightest
+    // things in frame, so ranking by integrated intensity pushes sensor
+    // hot-pixels and dim reflections to the tail, and the cap bounds the
+    // constellation solver's permutation-RANSAC combinatorics regardless
+    // of how many spurious blobs a busy scene produces. The cap only
+    // drops blobs beyond the 16 brightest, so the typical 5-10-blob
+    // PSVR frame is unaffected.
+    struct ScoredBlob { cv::Point2d pt; double brightness; };
+    std::vector<ScoredBlob> scored;
+    scored.reserve(contours.size());
     for (const auto& c : contours) {
         const double area = cv::contourArea(c);
         if (area < BLOB_MIN_AREA_PX || area > BLOB_MAX_AREA_PX) continue;
@@ -1227,10 +1246,15 @@ static void process_frame(Worker::Impl* s, CVPixelBufferRef buf) {
                      bbox.width + 2 * pad, bbox.height + 2 * pad);
         roi &= cv::Rect(0, 0, s->gray.cols, s->gray.rows);
         if (roi.width < 3 || roi.height < 3) {
-            blobs.emplace_back(cx_global, cy_global);
+            scored.push_back({cv::Point2d(cx_global, cy_global), area});
             continue;
         }
         const cv::Mat1b roi_gray = s->gray(roi);
+        // Integrated brightness over the ROI. The thresholded scene is
+        // dark everywhere but the LEDs, so the ROI sum is dominated by
+        // this blob's energy - a good, cheap ranking key. Used only for
+        // sort/cap ordering, never for geometry.
+        const double brightness = cv::sum(roi_gray)[0];
         // Kernel radius from the LED's footprint (radius = sqrt(A/pi))
         // scaled by tracker-pt's empirical MEAN_SHIFT_RADIUS_C.
         const double radius_px    = std::sqrt(area / CV_PI);
@@ -1247,8 +1271,27 @@ static void process_frame(Worker::Impl* s, CVPixelBufferRef buf) {
             pos = com_new;
             if (ddx * ddx + ddy * ddy < 1e-3) break;
         }
-        blobs.emplace_back(pos.x + roi.x, pos.y + roi.y);
+        scored.push_back({cv::Point2d(pos.x + roi.x, pos.y + roi.y),
+                          brightness});
     }
+
+    // Keep the brightest BLOB_POOL_MAX; emit their centroids in
+    // brightness order (brightest first).
+    if ((int)scored.size() > BLOB_POOL_MAX) {
+        std::nth_element(scored.begin(), scored.begin() + BLOB_POOL_MAX,
+                         scored.end(),
+                         [](const ScoredBlob& a, const ScoredBlob& b) {
+                             return a.brightness > b.brightness;
+                         });
+        scored.resize(BLOB_POOL_MAX);
+    }
+    std::sort(scored.begin(), scored.end(),
+              [](const ScoredBlob& a, const ScoredBlob& b) {
+                  return a.brightness > b.brightness;
+              });
+    std::vector<cv::Point2d> blobs;
+    blobs.reserve(scored.size());
+    for (const auto& sb : scored) blobs.push_back(sb.pt);
 
     // The overlay-drawing block below mutates a BGR copy of the
     // capture in-place. Use the owned bgr_owned we already built (the
