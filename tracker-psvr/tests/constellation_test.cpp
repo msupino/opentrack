@@ -198,6 +198,43 @@ int main() {
                 ok_frames, worst);
     check(ok_frames >= 8 && worst < 2.5, "combined rotation+translation tracked");
 
+    // ---- step 6: partial occlusion — only 3 LEDs visible while locked --
+    // Regression guard for the inlier-floor fix. With rotation IMU-locked
+    // the translation-only solve needs just 3 matched LEDs; the old
+    // kMinInliers=4 floor rejected these frames as NO_AP3P_FIT (the exact
+    // field symptom: "blobs=4-5, matched=3"). Establish a clean lock at a
+    // steady pose first (so the prior is good, as in the field), then drop
+    // to exactly 3 blobs with only small motion and require continued
+    // accurate tracking.
+    for (int i = 0; i < 4; ++i) {              // re-lock at current pose
+        auto blobs = make_blobs(R_true(), t_true, K, W, H, 0, rng);
+        r = st.solve(blobs, W, H, imu_yaw, imu_pitch, imu_roll, HFOV);
+    }
+    ok_frames = 0; worst = 0.0;
+    int three_blob_frames = 0;
+    for (int i = 0; i < 10; ++i) {
+        t_true(0) += 0.15;                     // gentle drift, prior stays good
+        auto blobs = make_blobs(R_true(), t_true, K, W, H, 0, rng);
+        if (blobs.size() < 3) continue;
+        // Keep the 3 brightest-equivalent (just the first 3 after the
+        // solver-agnostic shuffle) to simulate occlusion of the rest.
+        blobs.resize(3);
+        ++three_blob_frames;
+        r = st.solve(blobs, W, H, imu_yaw, imu_pitch, imu_roll, HFOV);
+        if (r.ok) {
+            ++ok_frames;
+            const double e = std::hypot(r.x_cm - t_true(0),
+                        std::hypot(r.y_cm - t_true(1), r.z_cm - t_true(2)));
+            worst = std::max(worst, e);
+        }
+    }
+    std::printf("      3-LED occlusion: ok=%d/%d  worst err=%.2f cm  "
+                "last reason=%s\n", ok_frames, three_blob_frames, worst,
+                r.reject_reason);
+    check(three_blob_frames >= 8 && ok_frames >= three_blob_frames - 2 &&
+          worst < 3.0,
+          "keeps locked on only 3 visible LEDs (inlier-floor fix)");
+
     std::printf("\n%s (%d failure%s)\n", fails ? "TEST FAILED" : "ALL PASS",
                 fails, fails == 1 ? "" : "s");
     return fails ? 1 : 0;
