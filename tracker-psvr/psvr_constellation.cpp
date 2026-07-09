@@ -259,11 +259,22 @@ constexpr double kMaxCmPerFrameFloor    = 3.0;
 // branch while still allowing very fast real head motion (20 deg at
 // 30 Hz = 600 deg/s).
 constexpr double kMaxCameraRotDegPerFrame = 20.0;
-// Minimum inliers for an already-locked track to continue. PSVR has
-// 9 LEDs; 4 is the AP3P minimum + 1 disambiguator. Used when we
-// have a fresh prior (i.e. continuing an existing lock); the
-// downstream jump gate provides the additional consistency check.
+// Minimum inliers for the COLD-START correspondence path, where
+// rotation is recovered optically by AP3P (which structurally needs 4
+// points). Used for the permutation search, its NO_AP3P_FIT gate, and
+// the cold-start ICP.
 constexpr int    kMinInliers            = 4;
+// Minimum inliers for the LOCKED path (have_prior), where rotation is
+// FIXED to the IMU-composed R and only the 3-DOF translation is fit.
+// AP3P's 4-point requirement does not apply here: 2 LEDs already give
+// 4 equations for 3 unknowns. We require 3 (6 equations) so the system
+// stays over-determined enough that the reprojection-RMS gate remains
+// a meaningful check - with only 2 points the fit is exact and RMS
+// can't validate it. This is the direct fix for the observed
+// "blobs=4-5, matched=3 -> NO_AP3P_FIT" dropouts: those frames are
+// solvable with rotation already known, and the RMS / Z / time-scaled
+// jump gates still guard correctness.
+constexpr int    kMinInliersLocked      = 3;
 // Stricter inlier count required for the FIRST-publish lock when
 // there's no fresh prior (cold start, or >1 s since last accepted
 // frame). The jump gate can't catch a false first-lock - there's
@@ -567,6 +578,12 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
         prior_epoch_sec = s.state_epoch_sec;
     }
 
+    // Inlier floor for this frame: the relaxed locked floor when rotation
+    // is IMU-fixed (translation-only solve), the strict AP3P floor at
+    // cold start. Threaded through the blob-count gate, prior-match
+    // acceptance, correspondence-result gate, and the ICP.
+    const int min_inliers = have_prior ? kMinInliersLocked : kMinInliers;
+
     const cv::Matx33d R_imu_now =
         head_to_camera_rotation(yaw_rad, pitch_rad, roll_rad);
     cv::Vec3d imu_rvec_now;
@@ -593,16 +610,6 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
                 }
             R = R_cached * R_imu_acc.t() * R_imu_now;
         }
-    }
-    if (std::getenv("PSVR_DBG_R")) {
-        std::fprintf(stderr, "[dbgR] have_prior=%d yaw=%.4f "
-            "cached=(%.4f %.4f %.4f) imu_acc=(%.4f %.4f %.4f) "
-            "imu_now=(%.4f %.4f %.4f) R00=%.5f R02=%.5f\n",
-            (int)have_prior, yaw_rad,
-            prior_rvec_cached(0), prior_rvec_cached(1), prior_rvec_cached(2),
-            prior_imu_rvec_cached(0), prior_imu_rvec_cached(1), prior_imu_rvec_cached(2),
-            imu_rvec_now(0), imu_rvec_now(1), imu_rvec_now(2),
-            R(0,0), R(0,2));
     }
 
     // Per-LED facing-camera dot-product diagnostic, every 60 solves
@@ -643,7 +650,7 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
         std::fprintf(stderr, "%s\n", buf);
     }
 
-    if ((int)blobs.size() < kMinInliers) {
+    if ((int)blobs.size() < min_inliers) {
         r.reject_reason = "TOO_FEW_BLOBS";
         if (dbg) {
             std::array<cv::Point2d, NUM_LEDS> empty_proj{};
@@ -846,8 +853,15 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
     // the best. O(kSamples * cost(AP3P)) ~= 300 * 80us = 24ms/frame
     // max, well under our 33ms budget. The kSamples cap keeps worst
     // case bounded regardless of blob count.
+    // k is the AP3P sample size for the cold-start permutation search
+    // (structurally needs 4). The blob/visible-count REJECT thresholds,
+    // however, use min_inliers: on the locked path (min_inliers=3) a
+    // 3-blob / 3-visible frame is solvable by the prior-match + fixed-
+    // rotation ICP without ever running AP3P, so it must not be rejected
+    // here. The permutation branch below is separately guarded to only
+    // run when there are >= k blobs/visible LEDs.
     const int k = kMinVisibleForPnp;  // min for P3P + disambiguation
-    if ((int)blobs.size() < k) {
+    if ((int)blobs.size() < min_inliers) {
         r.reject_reason = "TOO_FEW_BLOBS";
         log_frame(dbg, yaw_rad, pitch_rad, roll_rad, prior_tvec,
                   blobs, projected, visible,
@@ -862,7 +876,7 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
     for (int i = 0; i < NUM_LEDS; ++i)
         if (visible[i]) visible_leds.push_back(i);
     r.n_visible = (int)visible_leds.size();
-    if ((int)visible_leds.size() < k) {
+    if ((int)visible_leds.size() < min_inliers) {
         r.reject_reason = "TOO_FEW_VISIBLE";
         log_frame(dbg, yaw_rad, pitch_rad, roll_rad, prior_tvec,
                   blobs, projected, visible,
@@ -933,11 +947,16 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
             best_prior_d2 = 0.0;
             best_rvec = prior_rvec;
             best_tvec = prior_tvec;
-            best_from_prior = best_inliers >= kMinInliers;
+            best_from_prior = best_inliers >= min_inliers;
         }
     }
 
-    if (!best_from_prior) {
+    // Cold-start permutation search: only runnable with >= k blobs AND
+    // >= k visible LEDs (AP3P samples k distinct of each). A locked
+    // frame with 3 blobs skips this - it already has best_from_prior
+    // from the prior-match above, or is rejected below as NO_AP3P_FIT.
+    if (!best_from_prior &&
+        (int)blobs.size() >= k && (int)visible_leds.size() >= k) {
         for (int iter = 0; iter < kSamples; ++iter) {
             // Random k-subset of visible LEDs (sample without replacement).
             for (int i = 0; i < k; ++i) {
@@ -1072,7 +1091,7 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
     }
 
     r.n_matched = best_inliers;
-    if (r.n_matched < kMinInliers) {
+    if (r.n_matched < min_inliers) {
         r.reject_reason = "NO_AP3P_FIT";
         log_frame(dbg, yaw_rad, pitch_rad, roll_rad, prior_tvec,
                   blobs, projected, visible,
@@ -1227,7 +1246,7 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
                 matched_leds.push_back(mc.led);
                 matched_blobs.push_back(mc.blob);
             }
-            if ((int)matched_leds.size() < kMinInliers) break;
+            if ((int)matched_leds.size() < min_inliers) break;
             std::vector<cv::Point3d> obj_in;
             std::vector<cv::Point2d> img_in;
             obj_in.reserve(matched_leds.size());
@@ -1244,7 +1263,7 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
             const cv::Vec3d d = t_icp - t_prev;
             if (d.dot(d) < 1e-4) break;   // converged (<0.1 mm)
         }
-        return ok && (int)matched_leds.size() >= kMinInliers;
+        return ok && (int)matched_leds.size() >= min_inliers;
     };
 
     bool icp_ok = run_icp(prior_tvec);
@@ -1254,7 +1273,7 @@ Result SolverState::solve(const std::vector<cv::Point2d>& blobs,
     if (!icp_ok) {
         // Starved of matches vs. numerically diverged translation solve;
         // matched_leds reflects the last (fallback) attempt.
-        const bool starved = (int)matched_leds.size() < kMinInliers;
+        const bool starved = (int)matched_leds.size() < min_inliers;
         r.reject_reason = starved ? "NO_AP3P_FIT" : "T_SOLVE_DIVERGED";
         log_frame(dbg, yaw_rad, pitch_rad, roll_rad, prior_tvec,
                   blobs, projected, visible,
