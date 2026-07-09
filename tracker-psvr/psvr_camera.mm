@@ -306,45 +306,62 @@ static constexpr int BRIGHT_THRESH_CEIL  = 250;
 // vs the old 5/40 = 12%.
 static constexpr int N_TARGET_BRIGHT_PIXELS = 40;
 
-// Blue-dominance rescue threshold, applied to (B - max(R, G)) on the
-// 8-bit BGR frame. The adaptive grayscale threshold above has a hard
-// failure mode: anything in frame BRIGHTER than the LED cores (sunlit
+// Blue chroma-key rescue channel: chroma = B - 0.5*(G + R), the
+// tracker-pt continuous blue key (point_extractor.cpp filter_single_
+// channel, blue case). OR-ed with the luma brightness mask above.
+//
+// Why a rescue channel at all: the adaptive LUMA threshold has a hard
+// failure mode - anything in frame brighter than the LED cores (sunlit
 // wall, window, monitor, lamp) contributes >= N_TARGET_BRIGHT_PIXELS
-// of near-255 pixels, pins the threshold at BRIGHT_THRESH_CEIL, and
-// the (dimmer) LED cores fall below it - blobs vanish and the solver
-// never locks. The PSVR LEDs are strongly BLUE while those interferers
-// are white-ish (B ~= max(R,G), dominance ~ 0), so a parallel mask
-// keyed on blue dominance re-admits the LEDs no matter how bright the
-// background is. The two masks are OR-ed: brightness catches LED cores
-// that bloom to white (B=G=R=255, dominance 0), blue-dominance catches
-// the saturated blue halo when the core loses the brightness race.
-// 64 sits well above webcam AWB noise on white/grey scenes (< ~20)
-// and below a typical LED halo (B >= 200, G <= 80, R <= 40 -> >= 120).
-// Blue scene content that clears it (sky, blue wallpaper) yields big
-// or non-circular contours that the area/circularity gates drop.
-static constexpr int BLUE_DOMINANCE_THRESH = 64;
+// of near-255 pixels, pins the luma threshold at its ceiling, and the
+// dimmer LED cores fall below it, so blobs vanish and the solver never
+// locks. PSVR LEDs are strongly BLUE while those interferers are
+// white-ish (B ~= G ~= R -> chroma ~ 0), so the chroma channel
+// isolates the LEDs regardless of how bright the white background is.
+//
+// Upgraded from a FIXED cut (B - max(R,G) > 64) to a CONTINUOUS channel
+// fed through the same top-N adaptive threshold used for luma, because
+// PSVR blue renders at very different chroma levels across cameras
+// (UGREEN / FaceTime / OV580) - a single fixed cut is either noisy on
+// one camera or misses the LEDs on another; the adaptive walk tracks
+// the actual LED chroma level per frame. The floor keeps it above
+// webcam AWB chroma noise on white/grey scenes (empirically < ~20) so
+// a blue-free scene never drops the threshold into noise; the ceiling
+// bounds strongly-blue cameras. LED chroma is typically >= 120
+// (B>=200, G/R<=40..80), comfortably inside the band.
+//
+// The union with the luma mask is what makes this regression-safe:
+// bloomed-white LED cores (B=G=R=255 -> chroma 0) are still caught by
+// luma, so adding the chroma channel can only ADD detections, never
+// remove the ones the brightness path already finds.
+static constexpr int CHROMA_THRESH_FLOOR = 40;
+static constexpr int CHROMA_THRESH_CEIL  = 200;
 
-// Pick a brightness threshold by walking the histogram from V=255
-// down until cumulative pixel count reaches N_TARGET_BRIGHT_PIXELS.
-// Result is clamped to [FLOOR, CEIL]. O(W*H) for the histogram +
-// O(256) for the walk; ~0.5 ms total at 1280x720. No state -
-// next-frame's threshold is independent of this frame's, so a
-// momentary occlusion can't pin a bad value across frames.
-static int adaptive_bright_threshold(const cv::Mat& gray) {
+// Pick a threshold by walking a single-channel histogram from 255 down
+// until the cumulative pixel count reaches `target`, clamped to
+// [floor, ceil]. O(W*H) for the histogram + O(256) for the walk;
+// ~0.5 ms at 1280x720. No state - next frame's threshold is
+// independent, so a momentary occlusion can't pin a bad value.
+static int adaptive_topN_threshold(const cv::Mat& chan, int target,
+                                   int floor_v, int ceil_v) {
     int hist_size = 256;
     float range[] = {0.f, 256.f};
     const float* hist_range = range;
     cv::Mat hist;
-    cv::calcHist(&gray, 1, nullptr, cv::Mat(), hist, 1,
+    cv::calcHist(&chan, 1, nullptr, cv::Mat(), hist, 1,
                  &hist_size, &hist_range);
     int cum = 0;
     for (int v = 255; v >= 0; --v) {
         cum += static_cast<int>(hist.at<float>(v));
-        if (cum >= N_TARGET_BRIGHT_PIXELS)
-            return std::max(BRIGHT_THRESH_FLOOR,
-                            std::min(BRIGHT_THRESH_CEIL, v));
+        if (cum >= target)
+            return std::max(floor_v, std::min(ceil_v, v));
     }
-    return BRIGHT_THRESH_FLOOR;
+    return floor_v;
+}
+
+static int adaptive_bright_threshold(const cv::Mat& gray) {
+    return adaptive_topN_threshold(gray, N_TARGET_BRIGHT_PIXELS,
+                                   BRIGHT_THRESH_FLOOR, BRIGHT_THRESH_CEIL);
 }
 
 // Mean-shift kernel-radius multiplier. Matches tracker-pt's
@@ -1114,17 +1131,22 @@ static void process_frame(Worker::Impl* s, CVPixelBufferRef buf) {
     const int bright_thresh = adaptive_bright_threshold(s->gray);
     cv::threshold(s->gray, s->mask, bright_thresh, 255, cv::THRESH_BINARY);
 
-    // Blue-dominance rescue mask, OR-ed in (see BLUE_DOMINANCE_THRESH).
-    // Keeps the LEDs detectable when a brighter white-ish object in
-    // frame pins the adaptive threshold above the LED cores.
+    // Blue chroma-key rescue mask, OR-ed in (see CHROMA_THRESH_*).
+    // chroma = B - 0.5*(G+R), adaptively thresholded, unions with luma.
+    int chroma_thresh = 0;
+    int chroma_px = 0;
     {
         cv::Mat ch[3];
         cv::split(s->bgr_owned, ch);            // BGR order: ch[0] = B
-        cv::Mat maxrg, bdom, blue_mask;
-        cv::max(ch[2], ch[1], maxrg);           // max(R, G)
-        cv::subtract(ch[0], maxrg, bdom);       // CV_8U: saturates at 0
-        cv::threshold(bdom, blue_mask, BLUE_DOMINANCE_THRESH, 255,
+        cv::Mat gr, chroma, blue_mask;
+        cv::addWeighted(ch[1], 0.5, ch[2], 0.5, 0.0, gr);  // 0.5*(G+R)
+        cv::subtract(ch[0], gr, chroma);        // CV_8U saturates at 0
+        chroma_thresh = adaptive_topN_threshold(
+            chroma, N_TARGET_BRIGHT_PIXELS,
+            CHROMA_THRESH_FLOOR, CHROMA_THRESH_CEIL);
+        cv::threshold(chroma, blue_mask, chroma_thresh, 255,
                       cv::THRESH_BINARY);
+        chroma_px = cv::countNonZero(blue_mask);
         cv::bitwise_or(s->mask, blue_mask, s->mask);
     }
 
@@ -1151,8 +1173,9 @@ static void process_frame(Worker::Impl* s, CVPixelBufferRef buf) {
             double mn = 0, mx = 0;
             cv::minMaxLoc(s->gray, &mn, &mx);
             std::fprintf(stderr,
-                "[psvr-cam] frame brightness: min=%.0f max=%.0f thresh=%d\n",
-                mn, mx, bright_thresh);
+                "[psvr-cam] frame brightness: min=%.0f max=%.0f thresh=%d "
+                "| chroma thresh=%d px=%d\n",
+                mn, mx, bright_thresh, chroma_thresh, chroma_px);
         }
     }
 
