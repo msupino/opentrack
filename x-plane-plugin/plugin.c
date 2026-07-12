@@ -60,6 +60,11 @@ typedef struct WineSHM
     int gameid, gameid2;
     unsigned char table[8];
     bool stop;
+    // Layout must match proto-wine/wine-shm.h exactly. See comment
+    // there for rationale. We bump this counter in our
+    // `opentrack/center` command handler; proto-wine on the other
+    // side polls it and fires a re-center when it changes.
+    int center_seq;
 } volatile WineSHM;
 
 static shm_wrapper* lck_posix = NULL;
@@ -67,6 +72,7 @@ static WineSHM* shm_posix = NULL;
 static void *view_x, *view_y, *view_z, *view_heading, *view_pitch, *view_roll;
 static float offset_x, offset_y, offset_z;
 static XPLMCommandRef track_toggle = NULL, translation_disable_toggle = NULL;
+static XPLMCommandRef center_command = NULL;
 static int track_disabled = 1;
 static int translation_disabled;
 
@@ -205,6 +211,38 @@ static int TranslationToggleHandler(XPLMCommandRef inCommand,
     return 0;
 }
 
+// Command "opentrack/center": signals to opentrack (via the shared-
+// memory center_seq counter) that the user wants to re-center. Bind
+// this command to any joystick button in X-Plane's Settings >
+// Keyboard/Joystick dialog (e.g. a Honeycomb yoke button). When
+// pressed, we bump the counter; opentrack's proto-wine side compares
+// against its last-seen value on the next pose tick and fires a
+// re-center. This path sidesteps the macOS Carbon-global-hotkey
+// limitation where X-Plane's exclusive focus swallows F-key
+// shortcuts before they reach opentrack.
+//
+// Deliberately does NOT call reinit_offset(). Doing so accumulates
+// the current head pose into the local offset every press: opentrack
+// hasn't re-centered yet at this exact moment, so the dataref still
+// reflects the pre-center pose, and reading it as the new baseline
+// adds the not-yet-zeroed pose to the offset. Result: view drifts
+// (typically Y goes up) by the magnitude of your current head pose
+// on every button press. opentrack's own set_center on the next pose
+// tick is the single source of truth for "where is forward"; let it
+// do its job and leave the X-Plane offset alone.
+static int CenterHandler(XPLMCommandRef inCommand,
+                         XPLMCommandPhase inPhase,
+                         void* inRefCon)
+{
+    if (inPhase != xplm_CommandBegin) return 0;
+    if (lck_posix != NULL && shm_posix != NULL) {
+        shm_wrapper_lock(lck_posix);
+        shm_posix->center_seq++;
+        shm_wrapper_unlock(lck_posix);
+    }
+    return 0;
+}
+
 static inline
 void volatile_explicit_bzero(void volatile* restrict ptr, size_t len)
 {
@@ -232,6 +270,7 @@ int XPluginStart (char* outName, char* outSignature, char* outDescription) {
 
     track_toggle = XPLMCreateCommand("opentrack/toggle", "Disable/Enable head tracking");
     translation_disable_toggle = XPLMCreateCommand("opentrack/toggle_translation", "Disable/Enable input translation from opentrack");
+    center_command = XPLMCreateCommand("opentrack/center", "Re-center opentrack's head pose to current orientation");
 
     XPLMRegisterCommandHandler(track_toggle,
                                TrackToggleHandler,
@@ -243,13 +282,20 @@ int XPluginStart (char* outName, char* outSignature, char* outDescription) {
                                1,
                                NULL);
 
+    XPLMRegisterCommandHandler(center_command,
+                               CenterHandler,
+                               1,
+                               NULL);
+
 
     /* view_roll was previously omitted from this null-check guard, so on an
        X-Plane build that didn't expose `pilots_head_phi` the plugin would
        happily proceed and crash on the first XPLMSetDataf(view_roll, ...)
-       call inside write_head_position. */
+       call inside write_head_position. center_command is bundled in the
+       same guard because the bridge re-center command is registered in
+       lockstep with the SHM mapping below. */
     if (view_x && view_y && view_z && view_heading && view_pitch && view_roll
-        && track_toggle && translation_disable_toggle) {
+        && track_toggle && translation_disable_toggle && center_command) {
         lck_posix = shm_wrapper_init(WINE_SHM_NAME, WINE_MTX_NAME, sizeof(WineSHM));
         /* shm_wrapper_init now returns NULL on any failure (was previously
            assumed non-NULL with mem set to MAP_FAILED). The previous
@@ -287,6 +333,11 @@ void XPluginStop (void) {
         XPLMUnregisterCommandHandler(translation_disable_toggle,
                                      TranslationToggleHandler, 1, NULL);
         translation_disable_toggle = NULL;
+    }
+    if (center_command) {
+        XPLMUnregisterCommandHandler(center_command, CenterHandler,
+                                     1, NULL);
+        center_command = NULL;
     }
     if (lck_posix)
     {

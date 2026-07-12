@@ -99,15 +99,16 @@ Privacy sandboxing (macOS).
 
 ## Plugin commands
 
-The plugin registers two X-Plane commands that you can bind to joystick
+The plugin registers three X-Plane commands that you can bind to joystick
 buttons or keys from **Settings → Joystick** or **Settings → Keyboard**:
 
 | Command                         | Description                                                                                       |
 | ------------------------------- | ------------------------------------------------------------------------------------------------- |
 | `opentrack/toggle`              | Enable/disable the flight-loop callback. When off, no data is sent to X-Plane's datarefs.         |
 | `opentrack/toggle_translation`  | Enable/disable the translation part only (yaw/pitch/roll remain active). Re-centers on re-enable. |
+| `opentrack/center`              | Ask opentrack to re-center the head pose. Goes the other direction over the same shm — see below. |
 
-Both commands operate on `xplm_CommandBegin`, so they fire on button
+All three commands operate on `xplm_CommandBegin`, so they fire on button
 press (not release).
 
 ## Data conversions
@@ -137,14 +138,25 @@ typedef struct WineSHM {
     int           gameid, gameid2;
     unsigned char table[8];
     bool          stop;
+    int           center_seq; // X-Plane → opentrack re-center request, see below
 } volatile WineSHM;
 ```
 
-The X-Plane plugin only reads `data[]`; the other fields are used by the
-Wine freetrack flavor of proto-wine and are ignored here.
+The X-Plane plugin reads `data[]` and writes `center_seq`; the other
+fields are used by the Wine freetrack flavor of proto-wine and are
+ignored here.
 
-Access is guarded with a POSIX `flock(fd, LOCK_SH)` around the read —
-cheap, contention-free for single-writer/single-reader.
+Access is guarded with a POSIX `flock(fd, LOCK_SH)` around the read and
+`LOCK_EX` around the `center_seq` bump — cheap, contention-free for
+single-writer/single-reader.
+
+`center_seq` is appended at the **end** of the struct so old binaries
+on either side stay backward-compatible: an old `opentrack.xpl` against
+new opentrack simply doesn't bump it (opentrack reads zero and treats
+that as "no center request pending"). New `opentrack.xpl` against old
+opentrack writes one `int` past where the older struct ended — the SHM
+segment must be sized for the new struct, which the new `proto-wine`
+takes care of. Recommendation: rebuild both halves together.
 
 ## Plugin lifecycle
 
@@ -167,6 +179,84 @@ Failure paths in `shm_wrapper_init` (malloc / shm_open / ftruncate /
 mmap) are checked individually and log the failing syscall with
 `strerror(errno)` to X-Plane's `Log.txt` for diagnosis. On any failure
 `XPluginStart` returns 0 and X-Plane unloads the plugin cleanly.
+
+## Re-centering from in-sim controls
+
+The `opentrack/center` command is a back-channel that lets an X-Plane
+button (yoke, throttle quadrant, panel switch, anything bindable in
+**Settings → Joystick**) ask opentrack to re-center, with the same
+effect as clicking opentrack's **Center** button or pressing its
+keyboard hotkey.
+
+```
+┌─────────────────────────┐                  ┌──────────────────────────┐
+│ opentrack (proto-wine)  │                  │ X-Plane (opentrack.xpl)  │
+│                         │                  │                          │
+│ writes pose ──────────► │ POSIX SHM        │ ◄─ reads pose, drives    │
+│                         │ facetracknoir-   │    pilot view datarefs   │
+│ reads center_seq    ◄── │ wine-shm         │ ── writes center_seq     │
+│ rising-edge detect      │                  │    (CenterHandler)       │
+│ → set_center(true)      │                  │                          │
+└─────────────────────────┘                  └──────────────────────────┘
+```
+
+### Why this exists (macOS in particular)
+
+opentrack's global hotkey on macOS uses Carbon `RegisterEventHotKey`,
+which only sees **keyboard** events. When X-Plane has exclusive focus
+(especially fullscreen) it consumes function keys before the hotkey
+registration sees them, so keyboard-mapper workarounds (e.g. yoke
+button → F13 → opentrack Center shortcut) silently fail mid-flight.
+The `opentrack/center` command sidesteps the keyboard path entirely:
+the X-Plane plugin atomically bumps `center_seq` in shared memory,
+opentrack's `proto-wine` reads it on the other side and fires
+`set_center(true)` exactly once per increment — same code path the
+keyboard hotkey would have triggered. Mash-button presses are coalesced
+(multiple bumps between polls = one re-center, not one per press).
+
+### Binding it (Honeycomb Alpha example)
+
+1. In X-Plane: **Settings → Joystick**.
+2. Pick your Honeycomb Alpha (or any HID controller).
+3. Click the button you want (e.g. the white "Reset View" button on
+   the yoke).
+4. In the assignment dialog, search for `opentrack/center`.
+5. Pick it. Save.
+
+That button now re-centers opentrack regardless of focus state,
+fullscreen mode, or what other apps are listening for keyboard events.
+
+### Implementation pieces
+
+- `api/plugin-api.hpp` — `virtual bool IProtocol::center_requested()`
+  (default returns false).
+- `logic/pipeline.cpp` — polls `center_requested()` after each pose;
+  calls `set_center(true)` on rising edge.
+- `proto-wine/wine-shm.h` — `int center_seq` field, appended at end of
+  `WineSHM` (backward-compatible, see SHM layout above).
+- `proto-wine/ftnoir_protocol_wine.{h,cpp}` — `center_requested()`
+  override with edge-detection (returns true exactly once per
+  `center_seq` increment).
+- `x-plane-plugin/plugin.c` — `CenterHandler` callback bumps
+  `shm_posix->center_seq` atomically inside the plugin's `flock`'d
+  critical section.
+
+### Why `CenterHandler` doesn't call `reinit_offset()`
+
+An earlier prototype called `reinit_offset()` from `CenterHandler` to
+wipe the X-Plane translation offset alongside the re-center. That
+regression accumulated the pre-center pose into the X-Plane offset,
+causing visible Y-axis drift after each re-center. Removed: opentrack's
+`set_center` on the next pose tick is the single source of truth for
+"where is forward" — let it own that responsibility.
+
+### See also
+
+- [opentrack#2174](https://github.com/opentrack/opentrack/pull/2174) —
+  original upstream PR (closed pending end-to-end verification on
+  macOS).
+- [msupino#3](https://github.com/msupino/opentrack/pull/3) — fork PR
+  tracking this work while parked.
 
 ## Limitations and notes
 
