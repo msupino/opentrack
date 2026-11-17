@@ -68,6 +68,11 @@
 
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
+// OpenCV 5 moved contourArea/arcLength/moments/boundingRect from imgproc
+// into the new geometry module; OpenCV 4 has no such header.
+#if __has_include(<opencv2/geometry.hpp>)
+#include <opencv2/geometry.hpp>
+#endif
 
 #include <atomic>
 #include <mutex>

@@ -66,7 +66,7 @@ if(APPLE)
         set_source_files_properties(psvr_camera.mm PROPERTIES
             COMPILE_FLAGS "-fobjc-arc")
         target_link_libraries(${self} PRIVATE
-            opencv_core opencv_imgproc opencv_calib3d
+            opencv_core opencv_imgproc ${OTR_OPENCV_CALIB_MODULES}
             "-framework AVFoundation")
         target_compile_definitions(${self} PRIVATE PSVR_HAS_CAMERA=1)
     endif()
