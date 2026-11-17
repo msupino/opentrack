@@ -70,6 +70,10 @@ typedef struct WineSHM
 static shm_wrapper* lck_posix = NULL;
 static WineSHM* shm_posix = NULL;
 static void *view_x, *view_y, *view_z, *view_heading, *view_pitch, *view_roll;
+/* sim/graphics/view/view_type; 1026 == 3D cockpit. Head datarefs only make
+   sense there. */
+static void *view_type;
+#define VIEW_TYPE_3D_COCKPIT 1026
 static float offset_x, offset_y, offset_z;
 static XPLMCommandRef track_toggle = NULL, translation_disable_toggle = NULL;
 static XPLMCommandRef center_command = NULL;
@@ -156,6 +160,12 @@ float write_head_position(float inElapsedSinceLastCall,
                           int   inCounter,
                           void* inRefcon)
 {
+    /* Writing the pilots_head_* datarefs every frame while in an external
+       view (chase, spot, free camera...) fights X-Plane's own camera and
+       effectively disables those views. Only drive the head in 3D cockpit. */
+    if (view_type && XPLMGetDatai(view_type) != VIEW_TYPE_3D_COCKPIT)
+        return -1.0;
+
     if (lck_posix != NULL && shm_posix != NULL) {
         shm_wrapper_lock(lck_posix);
         if (!translation_disabled)
@@ -267,6 +277,7 @@ int XPluginStart (char* outName, char* outSignature, char* outDescription) {
     view_heading = XPLMFindDataRef("sim/graphics/view/pilots_head_psi");
     view_pitch = XPLMFindDataRef("sim/graphics/view/pilots_head_the");
     view_roll = XPLMFindDataRef("sim/graphics/view/pilots_head_phi");
+    view_type = XPLMFindDataRef("sim/graphics/view/view_type");
 
     track_toggle = XPLMCreateCommand("opentrack/toggle", "Disable/Enable head tracking");
     translation_disable_toggle = XPLMCreateCommand("opentrack/toggle_translation", "Disable/Enable input translation from opentrack");
