@@ -6,6 +6,7 @@
 
 #include "api/plugin-api.hpp"
 #include "options/options.hpp"
+#include "psvr_fusion.h"
 
 #include <atomic>
 #include <array>
@@ -105,6 +106,17 @@ struct psvr_settings : opts {
     // as untracked (and a Fusion setup can source them elsewhere).
     value<bool>    enable_ypr;
     value<bool>    enable_xyz;
+    // Wake the headset as soon as its control-interface status report
+    // (0xF0) says it powered off, e.g. after the firmware's ~8 minute
+    // inactivity sleep. Turning the headset off with its power button
+    // also triggers this, so it can be disabled.
+    value<bool>    auto_wake;
+    // A single press of the mic-mute button on the in-line remote
+    // recenters yaw (and the camera position origin).
+    value<bool>    remote_recenter;
+    // Use the pre-quaternion Euler complementary filter for rotation.
+    // Kept as a fallback while the quaternion filter gets field time.
+    value<bool>    legacy_imu_filter;
     psvr_settings() :
         opts("psvr-tracker"),
         // Default OFF: turning the mirror on is what triggers macOS's
@@ -123,7 +135,10 @@ struct psvr_settings : opts {
         camera_hfov_deg(b, "camera-hfov-deg", 70.0),
         camera_hfov_auto(b, "camera-hfov-auto", true),
         enable_ypr(b, "enable-ypr", true),
-        enable_xyz(b, "enable-xyz", true)
+        enable_xyz(b, "enable-xyz", true),
+        auto_wake(b, "auto-wake", true),
+        remote_recenter(b, "remote-recenter", true),
+        legacy_imu_filter(b, "legacy-imu-filter", false)
     {}
 };
 
@@ -261,6 +276,46 @@ private:
     std::atomic<bool>    display_active_{false};
     std::atomic<uint8_t> fw_cal_status_{255};
     std::atomic<uint16_t> ir_sensor_{0};     // 0=far, 1023=near
+
+    // Control-interface status report (report id 0xF0, ~20 bytes; layout
+    // per Monado psvr_parse_status_packet and i33mr/psvr-mac):
+    //   byte 4 bit 0 - headset powered, bit 1 - worn
+    //   byte 11      - 1 = VR mode, 0 = cinematic
+    // -1 = no status report seen yet this session. HID thread only.
+    int    status_powered_{-1};
+    int    status_vr_mode_{-1};
+    // Auto-wake (s_.auto_wake). When a status report shows the headset
+    // went from powered to off, schedule an activation burst after a
+    // short settle delay. Attempts are rate-limited so a user who turns
+    // the headset off on purpose isn't fought forever. HID thread only.
+    bool   auto_wake_enabled_{true};
+    double wake_at_{0.0};                    // 0 = nothing scheduled
+    double wake_window_start_{0.0};
+    int    wake_attempts_in_window_{0};
+    static constexpr double WAKE_SETTLE_SEC     = 1.0;
+    static constexpr double WAKE_WINDOW_SEC     = 120.0;
+    static constexpr int    WAKE_MAX_PER_WINDOW = 3;
+    void handle_status_report(const uint8_t* report, CFIndex len);
+
+    // Remote-button recenter (s_.remote_recenter): rising edge of the
+    // mic-mute bit in sensor-report byte 0. Yaw recenter happens on the
+    // HID thread (yaw_zero_deg_); the camera origin is owned by the
+    // opentrack thread in data(), so it's handed over via an atomic.
+    bool    remote_recenter_enabled_{true};
+    bool    remote_recenter_pending_{false};
+    uint8_t prev_buttons_{0};
+    static constexpr uint8_t BUTTON_MIC_MUTE = 0x08;
+    std::atomic<bool> remote_center_request_{false};
+
+    // Rotation filter. fusion_ is the quaternion filter (default);
+    // legacy_filter_ selects the old Euler complementary filter.
+    // yaw_zero_deg_ is subtracted from the published yaw only, so the
+    // camera worker keeps a stable, un-recentered rotation prior.
+    // HID thread only (except the published yaw_/pitch_/roll_ atomics).
+    psvr_fusion::Orientation fusion_;
+    bool   legacy_filter_{false};
+    double raw_yaw_deg_{0.0};
+    double yaw_zero_deg_{0.0};
 
     // Wall-clock (CFAbsoluteTime) of the last HID input report consumed.
     // Used for on-stall keepalive recovery: if the PSVR auto-sleeps
@@ -563,6 +618,9 @@ private:
     QCheckBox* camera_box_{nullptr};
     QCheckBox* ypr_box_{nullptr};
     QCheckBox* xyz_box_{nullptr};
+    QCheckBox* auto_wake_box_{nullptr};
+    QCheckBox* remote_recenter_box_{nullptr};
+    QCheckBox* legacy_filter_box_{nullptr};
     QComboBox* camera_name_box_{nullptr};
     // Camera horizontal-FOV spinbox; subordinate to camera_box_.
     // Wired to s_.camera_hfov_deg via tie_setting; value applied to

@@ -619,6 +619,15 @@ module_status PSVRTracker::start_tracker(QFrame* frame)
     }
     reactivate_next_time_ = 0.0;
 
+    auto_wake_enabled_       = static_cast<bool>(s_.auto_wake);
+    remote_recenter_enabled_ = static_cast<bool>(s_.remote_recenter);
+    legacy_filter_           = static_cast<bool>(s_.legacy_imu_filter);
+    qDebug().nospace() << "PSVR: rotation filter "
+                       << (legacy_filter_ ? "legacy (Euler)" : "quaternion")
+                       << ", auto-wake " << (auto_wake_enabled_ ? "on" : "off")
+                       << ", remote recenter "
+                       << (remote_recenter_enabled_ ? "on" : "off");
+
     worker_ = std::thread([this]{ worker_loop(); });
     if (s_.enable_mirror)
         psvr_mirror_start();
@@ -707,6 +716,15 @@ void PSVRTracker::data(double* data)
     const double raw_y = y;
     const double raw_z = z;
     bool held_pos = false;
+    // Remote-button recenter (set on the HID thread): re-latch the camera
+    // origin here, on the thread that owns it, same as center() does.
+    if (remote_center_request_.exchange(false, std::memory_order_acq_rel)) {
+        camera_origin_valid_ = false;
+        camera_origin_reset_pending_ = true;
+        head_x_.store(0, std::memory_order_relaxed);
+        head_y_.store(0, std::memory_order_relaxed);
+        head_z_.store(0, std::memory_order_relaxed);
+    }
     camera_position_fresh_.store(have_pos, std::memory_order_relaxed);
     if (have_pos) {
         if (!camera_origin_valid_ || camera_origin_reset_pending_) {
@@ -965,6 +983,12 @@ void PSVRTracker::process_group(const uint8_t* buf)
             }
             const double seed_pitch = accel_pitch_deg(avg_a);
             const double seed_roll  = accel_roll_deg(avg_a);
+            // Quaternion filter starts from the same resting attitude
+            // (its pitch/roll match accel_pitch_deg/accel_roll_deg; see
+            // tests/fusion_test.cpp) with heading zeroed.
+            fusion_.reset_from_gravity(psvr_fusion::accel_body_from_raw(avg_a));
+            raw_yaw_deg_  = 0.0;
+            yaw_zero_deg_ = 0.0;
             pitch_.store(seed_pitch, std::memory_order_relaxed);
             roll_.store(seed_roll,   std::memory_order_relaxed);
             yaw_.store(0.0,          std::memory_order_relaxed);
@@ -1069,12 +1093,41 @@ void PSVRTracker::process_group(const uint8_t* buf)
     }
     last_sample_tick_ = tick;
 
-    double yaw   = yaw_.load(std::memory_order_relaxed)   + gy * dt;
-    double pitch = ALPHA * (pitch_.load(std::memory_order_relaxed) + gp * dt) + (1.0 - ALPHA) * acc_pitch;
-    double roll  = ALPHA * (roll_.load(std::memory_order_relaxed)  + gr * dt) + (1.0 - ALPHA) * acc_roll;
+    // raw_yaw_deg_ is the un-recentered heading; the published yaw is
+    // raw minus yaw_zero_deg_ (remote-button recenter).
+    double pitch, roll;
+    if (legacy_filter_) {
+        // Old per-axis Euler complementary filter.
+        raw_yaw_deg_ += gy * dt;
+        pitch = ALPHA * (pitch_.load(std::memory_order_relaxed) + gp * dt) + (1.0 - ALPHA) * acc_pitch;
+        roll  = ALPHA * (roll_.load(std::memory_order_relaxed)  + gr * dt) + (1.0 - ALPHA) * acc_roll;
+    } else {
+        // Quaternion gyro integration with gated gravity correction
+        // (psvr_fusion.h). Takes the post-bias gyro and the raw accel.
+        fusion_.update(psvr_fusion::gyro_body_from_raw(g),
+                       psvr_fusion::accel_body_from_raw(a), dt);
+        const psvr_fusion::Angles ang = fusion_.angles();
+        raw_yaw_deg_ = ang.yaw;
+        pitch = ang.pitch;
+        roll  = ang.roll;
+    }
 
-    if (yaw >  180.0) yaw -= 360.0;
-    if (yaw < -180.0) yaw += 360.0;
+    // A single mic-mute press on the in-line remote (edge detected in
+    // report_cb) lands here as a request on this same thread.
+    if (remote_recenter_pending_) {
+        remote_recenter_pending_ = false;
+        yaw_zero_deg_ = raw_yaw_deg_;
+        remote_center_request_.store(true, std::memory_order_release);
+        qDebug() << "PSVR: recentered from the remote (mic-mute)";
+    }
+
+    auto wrap180 = [](double d) {
+        d = std::fmod(d + 180.0, 360.0);
+        if (d < 0) d += 360.0;
+        return d - 180.0;
+    };
+    raw_yaw_deg_ = wrap180(raw_yaw_deg_);
+    const double yaw = wrap180(raw_yaw_deg_ - yaw_zero_deg_);
 
     yaw_.store(yaw,     std::memory_order_relaxed);
     pitch_.store(pitch, std::memory_order_relaxed);
@@ -1086,10 +1139,12 @@ void PSVRTracker::process_group(const uint8_t* buf)
     // matching blobs. Cheap (3 atomic stores); called at ~2 kHz IMU
     // sample rate; the camera pipeline reads it at ~30 Hz. Converting
     // to radians here means the camera code doesn't have to know or
-    // care about opentrack's degree convention.
+    // care about opentrack's degree convention. Uses the un-recentered
+    // yaw: the solver calibrates its IMU-to-camera yaw offset at first
+    // lock, and a remote recenter must not shift that reference.
     if (camera_worker_) {
         const double deg2rad = M_PI / 180.0;
-        camera_worker_->set_rotation_prior(yaw   * deg2rad,
+        camera_worker_->set_rotation_prior(raw_yaw_deg_ * deg2rad,
                                            pitch * deg2rad,
                                            roll  * deg2rad);
     }
@@ -1173,11 +1228,37 @@ void PSVRTracker::report_cb(void* context, IOReturn, void*,
                             IOHIDReportType, uint32_t,
                             uint8_t* report, CFIndex reportLength)
 {
-    if (reportLength < 64 || !context) return;
+    if (!context || !report) return;
     auto* self = static_cast<PSVRTracker*>(context);
+
+    // The same callback serves every PSVR HID interface. The control
+    // interface sends short 0xF0 status reports (headset power, worn,
+    // VR mode); handle those before the sensor-report path, which used
+    // to drop them for being shorter than 64 bytes.
+    if (reportLength >= 12 && report[0] == 0xF0) {
+        self->handle_status_report(report, reportLength);
+        return;
+    }
+    if (reportLength < 64) return;
+    // Sensor reports start with the remote's button bits (0x02 vol+,
+    // 0x04 vol-, 0x08 mic mute); anything with the high nibble set is a
+    // control-interface reply, not IMU data.
+    if (report[0] & 0xF0) return;
+
     // Stamp BEFORE processing so on-stall logic in worker_loop has the
     // freshest possible "we heard from the headset" timestamp.
     self->last_report_time_ = CFAbsoluteTimeGetCurrent();
+
+    // Remote recenter: rising edge of mic-mute. Applied inside
+    // process_group so it uses the yaw computed from this report.
+    const uint8_t buttons = report[0];
+    if (self->remote_recenter_enabled_
+        && (buttons & BUTTON_MIC_MUTE) && !(self->prev_buttons_ & BUTTON_MIC_MUTE)
+        && self->calibrated_.load(std::memory_order_relaxed))
+    {
+        self->remote_recenter_pending_ = true;
+    }
+    self->prev_buttons_ = buttons;
 
     // Byte 8 = headset-state flags. Field layout documented in
     // psvr.h; semantics adopted from gusmanb/PSVRFramework's
@@ -1212,6 +1293,58 @@ void PSVRTracker::report_cb(void* context, IOReturn, void*,
 
     self->process_group(report + 16);
     self->process_group(report + 32);
+}
+
+// Control-interface status report (0xF0). Logs every change and, with
+// auto-wake on, schedules an activation burst when the headset goes from
+// powered to off - the firmware's ~8 minute sleep shows up here
+// immediately, well before the stall watchdog would notice the silent
+// IMU stream. Runs on the HID CFRunLoop thread; the burst itself is
+// sent from worker_loop on the same thread.
+void PSVRTracker::handle_status_report(const uint8_t* report, CFIndex len)
+{
+    const int powered = (report[4] & 0x01) ? 1 : 0;
+    const int worn    = (report[4] & 0x02) ? 1 : 0;
+    const int vr_mode = (len > 11 && report[11] == 1) ? 1 : 0;
+
+    const int prev_powered = status_powered_;
+    if (powered == prev_powered && vr_mode == status_vr_mode_)
+        return;
+    status_powered_ = powered;
+    status_vr_mode_ = vr_mode;
+
+    const double now = CFAbsoluteTimeGetCurrent();
+    qDebug().nospace() << "PSVR: status report - headset "
+                       << (powered ? "ON" : "OFF")
+                       << ", " << (vr_mode ? "VR" : "cinematic") << " mode, "
+                       << (worn ? "worn" : "not worn");
+    if (diag_log_) {
+        std::fprintf(diag_log_, "%.3f\t%7.2f\tSTATUS\tpowered=%d\tworn=%d\tvr=%d\n",
+                     now, now - diag_start_time_, powered, worn, vr_mode);
+        std::fflush(diag_log_);
+    }
+
+    if (prev_powered == 1 && powered == 0 && auto_wake_enabled_) {
+        if (now - wake_window_start_ > WAKE_WINDOW_SEC) {
+            wake_window_start_ = now;
+            wake_attempts_in_window_ = 0;
+        }
+        if (wake_attempts_in_window_ < WAKE_MAX_PER_WINDOW) {
+            ++wake_attempts_in_window_;
+            wake_at_ = now + WAKE_SETTLE_SEC;
+            qWarning().nospace() << "PSVR: headset powered off - waking it in "
+                                 << WAKE_SETTLE_SEC << "s (attempt "
+                                 << wake_attempts_in_window_ << "/"
+                                 << WAKE_MAX_PER_WINDOW << ")";
+        } else {
+            qWarning().nospace() << "PSVR: headset powered off again - "
+                                    "leaving it off (" << WAKE_MAX_PER_WINDOW
+                                 << " wake attempts in the last "
+                                 << WAKE_WINDOW_SEC << "s)";
+        }
+    } else if (powered == 1) {
+        wake_at_ = 0.0;   // came back on by itself (or by our burst)
+    }
 }
 
 void PSVRTracker::send_activation(IOHIDDeviceRef device)
@@ -1497,6 +1630,17 @@ void PSVRTracker::worker_loop()
             reactivate_next_time_ = now + reactivate_interval_s_;
         }
 
+        // Auto-wake scheduled by handle_status_report() after the
+        // headset reported powering off.
+        if (wake_at_ > 0.0 && now >= wake_at_) {
+            wake_at_ = 0.0;
+            qWarning() << "PSVR: firing activation burst to wake the headset";
+            send_activation_to_all();
+            // Don't let the stall watchdog fire a second burst while the
+            // stream restarts.
+            last_report_time_ = CFAbsoluteTimeGetCurrent();
+        }
+
         // Silent-stream detection. Two cases this needs to catch:
         //   (a) Cold start: no HID reports ever arrive in the first
         //       NO_DATA_TIMEOUT_SEC of Start - cable unplugged, box
@@ -1688,6 +1832,29 @@ PSVRDialog::PSVRDialog()
                     "Turn off to publish zero position. Requires camera "
                     "tracking below to actually produce a position."),
         s_.enable_xyz);
+
+    add_check_with_desc(auto_wake_box_,
+        QObject::tr("Wake the headset when it goes to sleep"),
+        QObject::tr("Turns the headset back on as soon as it reports "
+                    "powering off (the PSVR sleeps after ~8 minutes). "
+                    "Also undoes the power button, up to 3 times in 2 "
+                    "minutes; untick to switch the headset off by hand."),
+        s_.auto_wake);
+
+    add_check_with_desc(remote_recenter_box_,
+        QObject::tr("Recenter with the remote's mic-mute button"),
+        QObject::tr("A single press of the mic-mute button on the headset "
+                    "cable remote sets the current heading (and camera "
+                    "position) as center."),
+        s_.remote_recenter);
+
+    add_check_with_desc(legacy_filter_box_,
+        QObject::tr("Use the legacy rotation filter"),
+        QObject::tr("Falls back to the old per-axis filter. The default "
+                    "quaternion filter keeps pitch/roll steady during head "
+                    "movement and stays correct when turning while looking "
+                    "up or down. Applies on the next Start."),
+        s_.legacy_imu_filter);
 
     add_check_with_desc(camera_box_,
         QObject::tr("Enable camera-based position tracking [experimental]"),
@@ -1957,6 +2124,9 @@ void PSVRDialog::save()
     if (camera_box_)   s_.enable_camera   = camera_box_->isChecked();
     if (ypr_box_)      s_.enable_ypr      = ypr_box_->isChecked();
     if (xyz_box_)      s_.enable_xyz      = xyz_box_->isChecked();
+    if (auto_wake_box_)       s_.auto_wake         = auto_wake_box_->isChecked();
+    if (remote_recenter_box_) s_.remote_recenter   = remote_recenter_box_->isChecked();
+    if (legacy_filter_box_)   s_.legacy_imu_filter = legacy_filter_box_->isChecked();
     s_.b->save();
 }
 
@@ -1971,6 +2141,9 @@ void PSVRDialog::reload()
     if (camera_box_)   camera_box_->setChecked(s_.enable_camera);
     if (ypr_box_)      ypr_box_->setChecked(s_.enable_ypr);
     if (xyz_box_)      xyz_box_->setChecked(s_.enable_xyz);
+    if (auto_wake_box_)       auto_wake_box_->setChecked(s_.auto_wake);
+    if (remote_recenter_box_) remote_recenter_box_->setChecked(s_.remote_recenter);
+    if (legacy_filter_box_)   legacy_filter_box_->setChecked(s_.legacy_imu_filter);
 }
 
 OPENTRACK_DECLARE_TRACKER(PSVRTracker, PSVRDialog, PSVRMetadata)
